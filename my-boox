@@ -415,7 +415,111 @@ def print_usage(to=sys.stderr):
         "       my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]\n"
         "       my-boox --config [PATH]\n"
         "       my-boox --create-config [PATH]\n"
+        "       my-boox --help\n"
     )
+
+
+def print_help(to=sys.stdout):
+    to.write(f"""\
+my-boox -- send, list, and delete files on an Onyx BOOX device via BOOXDrop.
+
+USAGE
+  my-boox [-D|--debug] [--config [PATH]] send FILE
+  my-boox [-D|--debug] [--config [PATH]] ls|list
+  my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
+  my-boox --config [PATH]
+  my-boox --create-config [PATH]
+  my-boox --help
+
+COMMANDS
+  send FILE        Upload FILE to your BOOXDrop account. It'll show up on
+                    the device under Storage/Push (BOOXDrop app -> Push tab).
+
+  ls, list         List files currently on your BOOXDrop account, with their
+                    ID, size, and name. Use the ID with 'del'.
+
+  del ID [ID...]   Delete one or more files by ID (as shown by 'ls'), then
+                    print the resulting list.
+
+All three automatically handle authentication: if the stored token is
+missing, expired, or rejected by the server, my-boox requests a fresh
+6-digit verification code by email, prompts you for it, exchanges it for a
+new token, saves that token back to the config file, and retries the
+command once -- no separate login step to run by hand.
+
+OPTIONS
+  -D, --debug        Print the raw JSON of every API call to stderr.
+  --config [PATH]     With PATH: use that config file for this run only,
+                    instead of the normal search (see CONFIG below).
+                    Without PATH, and with no command given: print the
+                    config path my-boox would currently resolve to, and
+                    exit (does not require the file to actually exist).
+  --create-config [PATH]
+                    Write a template config file to PATH. Without PATH,
+                    print the template to stdout instead (so you can review
+                    it, or redirect it wherever you like) -- nothing is
+                    written to disk in that case.
+  -h, --help         Show this help and exit.
+
+CONFIG
+  my-boox reads a config file named 'my-boox.ini', in this format:
+
+      [default]
+      email =
+      token =
+      cloud = eur.boox.com
+
+  email  -- the address tied to your Onyx account. Required: this is who
+            re-auth emails a fresh verification code to.
+  token  -- filled in automatically the first time you authenticate; leave
+            this blank in a fresh config.
+  cloud  -- your BOOXDrop server region. 'eur.boox.com' for EU accounts,
+            'push.boox.com' for US/VN. Matches the server shown on the
+            device's own BOOXDrop / send2boox login screen.
+
+  SEARCH ORDER (first match wins, no merging across locations):
+      1. /LINKS/default/my-boox.ini
+      2. ~/my-boox.ini
+      3. /etc/my-boox.ini
+      4. /usr/local/etc/my-boox.ini
+
+  Run 'my-boox --config' with no other arguments at any time to see exactly
+  which of these paths it currently resolves to (useful when you're not
+  sure which one is actually in effect, e.g. if you have both a personal
+  and a system-wide copy).
+
+  A '--config PATH' passed alongside a command (e.g.
+  'my-boox --config ~/work-boox.ini ls') overrides the search entirely for
+  that single run, without touching which file the search would otherwise
+  find.
+
+SELF-MANAGED VIRTUALENV
+  my-boox has two dependencies (requests, oss2) and manages its own
+  virtualenv for them automatically -- nothing to pip install by hand.
+
+  On first run, it creates a venv at ~/.python.venv/my-boox, installs both
+  packages into it, then re-execs itself under that interpreter. Every
+  run after the first is instant (it just checks the venv already exists).
+  Delete that directory to force a clean reinstall.
+
+EXAMPLES
+  my-boox --create-config              # see the template
+  my-boox --create-config ~/my-boox.ini  # write it there
+  my-boox --config                     # where would my-boox look?
+  my-boox send report.pdf
+  my-boox ls
+  my-boox del 6835ffbf89ac7242e1ada708
+  my-boox -D ls                        # with raw API responses on stderr
+
+EXIT CODES
+  201  wrong usage / missing arg / unknown command
+  202  file not found (send)
+  203  venv bootstrap failed
+  204  action failed even after re-auth retry
+  205  re-auth step itself failed (no email configured, no code entered,
+       or the request-code/obtain-token API call itself failed)
+  206  no config file found and none could be resolved
+""")
 
 
 def main(argv):
@@ -442,7 +546,7 @@ def main(argv):
                 create_config_path = argv[i + 1]
                 i += 1
         elif a in ("-h", "--help"):
-            print_usage(sys.stdout)
+            print_help(sys.stdout)
             return 0
         else:
             rest.append(a)
