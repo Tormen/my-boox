@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""
+my-boox -- send, list, and delete files on an Onyx BOOX device via BOOXDrop.
+
+Self-contained single-file CLI. Merges the functionality originally spread
+across hrw/onyx-send2boox's boox.py, send_file.py, obtain_token.py,
+request_verification_code.py, and delete_files.py
+(https://github.com/hrw/onyx-send2boox, MIT licensed, (c) 2022 Marcin
+Juszkiewicz) into one file, with:
+
+  - proper auth-failure detection (checks HTTP status / result_code instead
+    of assuming any 'data' key shape means success or failure)
+  - automatic re-authentication: on an auth failure, requests a fresh
+    verification code, prompts for it, obtains a new token, saves it, and
+    retries the action once
+  - a Name-column separator sized to the longest actual filename instead of
+    a fixed-width line
+  - a self-managed virtualenv under ~/.python.venv/my-boox (created and
+    populated with its two dependencies -- requests, oss2 -- on first run;
+    this script re-execs itself under that interpreter automatically)
+  - --config/--create-config and -D/--debug, matching this user's other
+    my-* script conventions
+
+Usage:
+  my-boox [-D|--debug] [--config [PATH]] send FILE
+  my-boox [-D|--debug] [--config [PATH]] ls|list
+  my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
+  my-boox --config [PATH]           # print resolved config path and exit
+  my-boox --create-config [PATH]    # print (or write) a template config
+
+Config search order (first match wins): /LINKS/default/ -> ~/ -> /etc/ ->
+/usr/local/etc/, filename my-boox.ini. Config format:
+
+  [default]
+  email =
+  token =
+  cloud = eur.boox.com
+
+err codes:
+  201  wrong usage / missing arg / unknown command
+  202  file not found (send only)
+  203  venv bootstrap failed
+  204  action failed even after re-auth retry
+  205  re-auth step itself failed (no email configured / no code entered /
+       request-code or obtain-token call failed)
+  206  no config file found and none could be resolved
+"""
+
+import os
+import sys
+
+
+def die(msg, code=1):
+    """Write msg to stderr and exit with an explicit numeric code.
+    (sys.exit(str) always returns exit code 1 regardless of message
+    content, which isn't good enough for our documented err codes.)"""
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Self-bootstrapping venv -- runs before anything else, before any non-stdlib
+# imports. If we're not already inside our managed venv, create it (once),
+# install the two deps into it, and re-exec this same script under it.
+# ---------------------------------------------------------------------------
+
+VENV_DIR = os.path.expanduser("~/.python.venv/my-boox")
+_VENV_MARKER = "_MY_BOOX_VENV_ACTIVE"
+
+
+def _bootstrap_venv():
+    if os.environ.get(_VENV_MARKER) == "1":
+        return
+
+    import subprocess
+
+    python_bin = os.path.join(VENV_DIR, "bin", "python3")
+
+    if not os.path.exists(python_bin):
+        sys.stderr.write(f"my-boox: setting up venv at {VENV_DIR} (first run)...\n")
+        try:
+            subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
+            subprocess.check_call(
+                [python_bin, "-m", "pip", "install", "--quiet", "--upgrade", "pip"]
+            )
+            subprocess.check_call(
+                [python_bin, "-m", "pip", "install", "--quiet",
+                 "requests", "oss2>=2.16"]
+            )
+        except subprocess.CalledProcessError as e:
+            die(f"my-boox: venv bootstrap failed ({e}); "
+                f"remove {VENV_DIR} and retry, or check network access", 203)
+        except OSError as e:
+            die(f"my-boox: venv bootstrap failed ({e})", 203)
+
+    os.environ[_VENV_MARKER] = "1"
+    os.execv(python_bin, [python_bin] + sys.argv)
+
+
+_bootstrap_venv()
+
+# ---------------------------------------------------------------------------
+# From here on we're guaranteed to be running inside the managed venv, so
+# these imports are safe.
+# ---------------------------------------------------------------------------
+
+import configparser
+import json
+import locale
+import uuid
+
+import requests
+import oss2
+
+DEFAULT_CLOUD = "eur.boox.com"
+CONFIG_FILENAME = "my-boox.ini"
+CONFIG_SEARCH_DIRS = ["/LINKS/default", os.path.expanduser("~"), "/etc", "/usr/local/etc"]
+KNOWN_CMDS = {"send", "ls", "list", "del", "delete"}
+
+CONFIG_TEMPLATE = """[default]
+email =
+token =
+cloud = eur.boox.com
+"""
+
+
+class BooxAuthError(Exception):
+    """Raised when the API call fails due to an invalid/expired token or
+    a rejected credential exchange (HTTP 4xx/5xx, or a nonzero result_code).
+    Triggers the automatic re-auth flow."""
+
+
+class BooxAPIError(Exception):
+    """Raised for anything else that goes wrong talking to the API (bad
+    JSON, an unexpected response shape). Not auto-retried."""
+
+
+# ---------------------------------------------------------------------------
+# Config handling
+# ---------------------------------------------------------------------------
+
+def resolve_config_path(required=False):
+    for d in CONFIG_SEARCH_DIRS:
+        p = os.path.join(d, CONFIG_FILENAME)
+        if os.path.isfile(p):
+            return p
+    if required:
+        die(
+            "my-boox: no config found in " + ", ".join(CONFIG_SEARCH_DIRS) +
+            " -- run 'my-boox --create-config' to create one",
+            206,
+        )
+    return os.path.join(CONFIG_SEARCH_DIRS[0], CONFIG_FILENAME)
+
+
+def load_config(path):
+    config = configparser.ConfigParser()
+    if os.path.isfile(path):
+        config.read(path)
+    if "default" not in config:
+        config["default"] = {}
+    config["default"].setdefault("email", "")
+    config["default"].setdefault("token", "")
+    config["default"].setdefault("cloud", DEFAULT_CLOUD)
+    return config
+
+
+def save_config(path, config):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        config.write(f)
+
+
+# ---------------------------------------------------------------------------
+# API layer
+# ---------------------------------------------------------------------------
+
+def _get(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur or cur[k] is None:
+            raise BooxAPIError(f"unexpected API response shape (missing '{k}')")
+        cur = cur[k]
+    return cur
+
+
+def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
+             params=None, api="api/1", debug=False):
+    headers = dict(headers or {})
+    body = None
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if data:
+        headers["Content-Type"] = "application/json;charset=utf-8"
+        method = "POST"
+        body = json.dumps(data)
+
+    try:
+        resp = requests.request(
+            method, f"https://{cloud}/{api}/{api_url}",
+            headers=headers, params=params, data=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        raise BooxAPIError(f"network error calling {api_url}: {e}") from e
+
+    try:
+        payload = resp.json()
+    except ValueError as e:
+        raise BooxAPIError(
+            f"non-JSON response (HTTP {resp.status_code}) from {api_url}: "
+            f"{resp.text[:200]}"
+        ) from e
+
+    if debug:
+        sys.stderr.write(json.dumps(payload, indent=2) + "\n")
+
+    result_code = payload.get("result_code") if isinstance(payload, dict) else None
+    if resp.status_code >= 400 or (result_code is not None and result_code != 0):
+        msg = payload.get("message", f"HTTP {resp.status_code}") if isinstance(payload, dict) else f"HTTP {resp.status_code}"
+        raise BooxAuthError(f"{api_url} failed: {msg}")
+
+    return payload
+
+
+def do_request_code(cloud, email, debug=False):
+    api_call(cloud, None, "users/sendMobileCode", data={"mobi": email}, debug=debug)
+
+
+def do_obtain_token(cloud, email, code, debug=False):
+    payload = api_call(
+        cloud, None, "users/signupByPhoneOrEmail",
+        data={"mobi": email, "code": code}, debug=debug,
+    )
+    return _get(payload, "data", "token")
+
+
+def get_uid(cloud, token, debug=False):
+    payload = api_call(cloud, token, "users/me", debug=debug)
+    return _get(payload, "data", "uid")
+
+
+def do_list(cloud, token, limit=24, offset=0, debug=False):
+    payload = api_call(
+        cloud, token, "push/message",
+        params={"where": "{" f'"limit": {limit}, ' f'"offset": {offset}, ' '"parent": 0}'},
+        debug=debug,
+    )
+    files = payload.get("list", []) if isinstance(payload, dict) else []
+
+    rows = []
+    for entry in files:
+        data = entry["data"]["args"]
+        fmt = data["formats"][0]
+        size = int(data["storage"][fmt]["oss"]["size"])
+        rows.append((data["_id"], size, data["name"]))
+
+    # I would expect LC_ALL to be set but it may not be (kept from upstream,
+    # affects the ':>10n' locale-aware digit grouping below)
+    locale.setlocale(locale.LC_ALL, locale.getlocale()[0])
+
+    name_width = max([len(r[2]) for r in rows] + [len("Name")])
+    print("        ID               |    Size    | Name")
+    print("-------------------------|------------|" + "-" * name_width)
+    for _id, size, name in rows:
+        print(f"{_id} | {size:>10n} | {name}")
+
+    return rows
+
+
+def do_delete(cloud, token, ids, debug=False):
+    api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
+
+
+def do_send(cloud, token, filename, debug=False):
+    uid = get_uid(cloud, token, debug=debug)
+    api_call(cloud, token, "users/getDevice", debug=debug)
+    api_call(cloud, token, "im/getSig", params={"user": uid}, debug=debug)
+
+    buckets = api_call(cloud, token, "config/buckets", debug=debug)
+    onyx_cloud = _get(buckets, "data", "onyx-cloud")
+    bucket_name = onyx_cloud["bucket"]
+    endpoint = onyx_cloud["aliEndpoint"]
+
+    stss = api_call(cloud, token, "config/stss", debug=debug)
+    stss_data = _get(stss, "data")
+    access_key_id = stss_data["AccessKeyId"]
+    access_key_secret = stss_data["AccessKeySecret"]
+    security_token = stss_data["SecurityToken"]
+
+    auth = oss2.Auth(access_key_id, access_key_secret)
+    bucket = oss2.Bucket(auth, endpoint, bucket_name)
+
+    _, extension = os.path.splitext(filename)
+    remotename = f"{uid}/push/{uuid.uuid4()}{extension}"
+    token_headers = {"x-oss-security-token": security_token}
+    oss2.resumable_upload(bucket, remotename, filename, headers=token_headers)
+
+    basename = os.path.basename(filename)
+    api_call(
+        cloud, token, "push/saveAndPush",
+        data={
+            "data": {
+                "bucket": bucket_name,
+                "name": basename,
+                "parent": None,
+                "resourceDisplayName": basename,
+                "resourceKey": remotename,
+                "resourceType": "txt",
+                "title": basename,
+            }
+        },
+        debug=debug,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Re-auth wrapper
+# ---------------------------------------------------------------------------
+
+def with_reauth(action, config, config_path, debug=False):
+    """Run action(token) with the stored token. On BooxAuthError, request a
+    fresh verification code, prompt for it, obtain a new token, save it, and
+    retry once. Raises SystemExit on any unrecoverable failure."""
+
+    token = config["default"].get("token") or None
+
+    try:
+        return action(token)
+    except BooxAuthError as e:
+        if debug:
+            sys.stderr.write(f"my-boox: first attempt failed: {e}\n")
+
+        email = config["default"].get("email", "")
+        if not email:
+            die(
+                "my-boox: no email configured -- run 'my-boox --create-config' "
+                "and fill in 'email'",
+                205,
+            )
+        cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+
+        sys.stderr.write("my-boox: auth failed, requesting a fresh verification code...\n")
+        try:
+            do_request_code(cloud, email, debug=debug)
+        except (BooxAuthError, BooxAPIError) as e2:
+            die(f"my-boox: requesting verification code failed: {e2}", 205)
+        sys.stderr.write("Code for token requested. Check email.\n")
+
+        code = input(f"Check {email} for the 6-digit code, then enter it: ").strip()
+        if not code:
+            die("my-boox: no code entered, aborting", 205)
+
+        try:
+            new_token = do_obtain_token(cloud, email, code, debug=debug)
+        except (BooxAuthError, BooxAPIError) as e2:
+            die(f"my-boox: obtaining token failed: {e2}", 205)
+
+        config["default"]["token"] = new_token
+        save_config(config_path, config)
+
+        try:
+            return action(new_token)
+        except BooxAuthError as e2:
+            die(f"my-boox: still failing after re-auth retry: {e2}", 204)
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+def cmd_send(config, config_path, filename, debug=False):
+    filename = os.path.abspath(os.path.expanduser(filename))
+    if not os.path.isfile(filename):
+        die(f"my-boox: file not found: {filename}", 202)
+    cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+
+    def action(token):
+        do_send(cloud, token, filename, debug=debug)
+
+    with_reauth(action, config, config_path, debug=debug)
+    print(f"sent: {os.path.basename(filename)}")
+
+
+def cmd_ls(config, config_path, debug=False):
+    cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+
+    def action(token):
+        return do_list(cloud, token, debug=debug)
+
+    with_reauth(action, config, config_path, debug=debug)
+
+
+def cmd_del(config, config_path, ids, debug=False):
+    cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+
+    def action(token):
+        do_delete(cloud, token, ids, debug=debug)
+        do_list(cloud, token, debug=debug)
+
+    with_reauth(action, config, config_path, debug=debug)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def print_usage(to=sys.stderr):
+    to.write(
+        "usage: my-boox [-D|--debug] [--config [PATH]] send FILE\n"
+        "       my-boox [-D|--debug] [--config [PATH]] ls|list\n"
+        "       my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]\n"
+        "       my-boox --config [PATH]\n"
+        "       my-boox --create-config [PATH]\n"
+    )
+
+
+def main(argv):
+    debug = False
+    config_override = None
+    config_flag = False
+    create_config_flag = False
+    create_config_path = None
+    rest = []
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-D", "--debug"):
+            debug = True
+        elif a == "--config":
+            config_flag = True
+            if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
+                config_override = argv[i + 1]
+                i += 1
+        elif a == "--create-config":
+            create_config_flag = True
+            if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
+                create_config_path = argv[i + 1]
+                i += 1
+        elif a in ("-h", "--help"):
+            print_usage(sys.stdout)
+            return 0
+        else:
+            rest.append(a)
+        i += 1
+
+    if create_config_flag:
+        if create_config_path:
+            path = os.path.expanduser(create_config_path)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(CONFIG_TEMPLATE)
+            print(f"wrote template config to {path}")
+        else:
+            sys.stdout.write(CONFIG_TEMPLATE)
+        return 0
+
+    if not rest:
+        if config_flag:
+            print(config_override or resolve_config_path())
+            return 0
+        print_usage()
+        return 201
+
+    if config_flag and config_override is None and rest:
+        # bare --config alongside a subcommand: no override given, just use
+        # normal resolution silently for this run
+        pass
+
+    cmd = rest[0]
+    cmd_args = rest[1:]
+
+    if cmd not in KNOWN_CMDS:
+        sys.stderr.write(f"my-boox: unknown command: {cmd} (expected send, ls, or del)\n")
+        return 201
+
+    config_path = config_override or resolve_config_path(required=False)
+    config = load_config(config_path)
+
+    if cmd == "send":
+        if len(cmd_args) != 1:
+            sys.stderr.write("usage: my-boox send FILE\n")
+            return 201
+        cmd_send(config, config_path, cmd_args[0], debug=debug)
+        return 0
+
+    if cmd in ("ls", "list"):
+        cmd_ls(config, config_path, debug=debug)
+        return 0
+
+    if cmd in ("del", "delete"):
+        if not cmd_args:
+            sys.stderr.write("usage: my-boox del ID [ID...]\n")
+            return 201
+        cmd_del(config, config_path, cmd_args, debug=debug)
+        return 0
+
+    # unreachable given the KNOWN_CMDS check above
+    return 201
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
