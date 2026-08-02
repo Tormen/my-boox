@@ -124,6 +124,14 @@ token =
 cloud = eur.boox.com
 """
 
+# Phantom entries that push/message lists forever but which have no real
+# neocloud registration (no cbMsg field) and can't actually be removed --
+# batchDelete reports success but never clears them. Add an id here to
+# hide it from `ls`. Too rare to warrant a config option or command.
+IGNORED_IDS = {
+    "6a6e0015ca025b6e4826146f",  # 00.KEY...pdf, pre-fix fossil, no cbMsg
+}
+
 
 class BooxAuthError(Exception):
     """Raised when the API call fails due to an invalid/expired token or
@@ -290,6 +298,8 @@ def do_list(cloud, token, limit=24, offset=0, debug=False):
     rows = []
     for entry in files:
         data = entry["data"]["args"]
+        if data["_id"] in IGNORED_IDS:
+            continue
         fmt = data["formats"][0]
         size = int(data["storage"][fmt]["oss"]["size"])
         rows.append((data["_id"], size, data["name"]))
@@ -357,6 +367,44 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
     return result
 
 
+def neocloud_lookup_rev(cloud, session_id, neocloud_id, debug=False):
+    """GET /neocloud/<id> directly to discover its current _rev, on the
+    hypothesis that for anything created via saveAndPush, the api/1 _id and
+    the neocloud _id are the same value (confirmed true for at least one
+    case: cbMsg.id matched ls's _id exactly). Returns the _rev string, or
+    None if the id doesn't exist there (404) -- a real, expected outcome
+    for ids that never actually reached /neocloud/ at all."""
+    headers = {"Cookie": f"SyncGatewaySession={session_id}"}
+    if debug:
+        sys.stderr.write(f">>> GET https://{cloud}/neocloud/{neocloud_id}\n")
+    try:
+        resp = requests.get(f"https://{cloud}/neocloud/{neocloud_id}",
+                             headers=headers, timeout=30)
+    except requests.RequestException as e:
+        raise BooxAPIError(f"network error looking up neocloud/{neocloud_id}: {e}") from e
+
+    if resp.status_code == 404:
+        if debug:
+            sys.stderr.write("<<< 404 (not in neocloud)\n")
+        return None
+
+    try:
+        result = resp.json()
+    except ValueError as e:
+        raise BooxAPIError(
+            f"non-JSON response (HTTP {resp.status_code}) looking up "
+            f"neocloud/{neocloud_id}: {resp.text[:200]}"
+        ) from e
+
+    if debug:
+        sys.stderr.write(f"<<< {json.dumps(result, indent=2)}\n")
+
+    if resp.status_code >= 400:
+        raise BooxAPIError(f"neocloud/{neocloud_id} lookup failed: HTTP {resp.status_code}: {result}")
+
+    return result.get("_rev")
+
+
 def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
     """Submit a proper CouchDB/Sync Gateway tombstone for a document we
     know the real current revision of. current_rev is the bare hash part
@@ -380,22 +428,31 @@ def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
 def do_delete(cloud, token, ids, state, debug=False):
     """Delete each id. For any id we have a tracked neocloud (id, rev) for
     (i.e. it was sent by this tool's own 'send' since state-tracking was
-    added), submit a real tombstone to /neocloud/ first -- this is the
-    actual delivery layer, confirmed the same way 'send' was. Then call the
-    legacy api/1 batchDelete for account-listing parity either way. For
-    untracked ids (sent before this feature existed, or via the website),
-    only the legacy call happens -- deleting those from the device itself
-    isn't possible without first discovering their neocloud doc, which
-    isn't implemented."""
-    untracked = []
+    added), submit a real tombstone to /neocloud/ using that. For untracked
+    ids, try discovering a current rev by looking up the api/1 id directly
+    as a neocloud id -- confirmed to be the same value for at least one
+    saveAndPush-created file. Only if that lookup 404s (genuinely not in
+    neocloud) do we fall back to the legacy-only, likely-ineffective
+    api/1 batchDelete call. Either way, batchDelete is also called for
+    account-listing parity."""
+    truly_untracked = []
+    session_id = None
     for _id in ids:
         entry = state.get(_id)
         if entry:
             neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
+            continue
+
+        if session_id is None:
+            session_id = get_neocloud_cookie(cloud, token, debug=debug)
+        rev = neocloud_lookup_rev(cloud, session_id, _id, debug=debug)
+        if rev:
+            neocloud_delete_doc(cloud, token, _id, rev, debug=debug)
         else:
-            untracked.append(_id)
+            truly_untracked.append(_id)
+
     api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
-    return untracked
+    return truly_untracked
 
 
 def do_send(cloud, token, filename, debug=False):
