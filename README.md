@@ -27,6 +27,26 @@ directly (its `boox.py`, `send_file.py`, `obtain_token.py`,
 - **Automatic re-authentication.** On an auth failure, it requests a fresh
   verification code, prompts you for it, obtains a new token, saves it, and
   retries the action once — no more running three separate scripts by hand.
+- **Actual device delivery, not just account registration.** `saveAndPush`'s
+  response includes a `cbMsg` field — confirmed, by capturing a real browser
+  session, to be the id/rev of the document it writes server-side to
+  `/neocloud/` (a Couchbase Sync Gateway instance speaking a CouchDB-style
+  replication protocol), which is what the device actually replicates
+  against. An earlier version of this tool additionally wrote its own
+  separate `/neocloud/` document before calling `saveAndPush`, which turned
+  out to be redundant — it created an orphaned duplicate visible in the
+  BOOXDrop web UI (but not in `ls`, since `push/message` only ever knew
+  about the real one). Removed; `send` now just calls `saveAndPush` and
+  captures the `cbMsg` id/rev it returns.
+- **`del` that actually works**, for anything sent by this tool. Using the
+  `cbMsg` id/rev captured at send time (saved to a small local state file
+  next to your config), `del` submits a real CouchDB/Sync Gateway tombstone
+  to `/neocloud/` — not just the legacy `push/message/batchDelete` REST call,
+  which returns success but was confirmed (by waiting well over a minute)
+  to not actually remove anything from the device on its own. Files sent
+  before this feature existed, or via the website, aren't in that state
+  file, so `del` on those still only does the legacy call and may not
+  actually clear them from the device — see the note in Use below.
 - **A separator line sized to your actual filenames**, not a fixed 57-dash
   string.
 - **A fixed remote-filename bug**: the upstream code produced names like
@@ -98,6 +118,14 @@ my-boox ls
 my-boox del 6835ffbf89ac7242e1ada708
 my-boox del 6835ffbf89ac7242e1ada708 6a6df289d2c1f36e5ee55b9d
 ```
+
+> **`del` fully works for anything sent by `my-boox` itself** (tracked via
+> a small `<config>.neocloud-state.json` file created alongside your config).
+> For files sent before this feature existed, or via the website, `del`
+> still only runs the legacy `push/message/batchDelete` call, which is
+> confirmed to *not* reliably remove the file from the device — use the
+> BOOXDrop web UI's trash icon for those instead. `del` tells you explicitly
+> when an id falls into this untracked category.
 
 Add `-D`/`--debug` to any command to see the raw JSON of every API call on
 stderr.

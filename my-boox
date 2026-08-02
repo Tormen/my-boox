@@ -107,6 +107,7 @@ _bootstrap_venv()
 import configparser
 import json
 import locale
+import time
 import uuid
 
 import requests
@@ -173,6 +174,30 @@ def save_config(path, config):
         config.write(f)
 
 
+def state_path_for(config_path):
+    return config_path + ".neocloud-state.json"
+
+
+def load_state(config_path):
+    """Maps api1_id -> {"neocloud_id": ..., "rev": ...} for files this tool
+    itself sent, so 'del' can submit a real tombstone instead of only the
+    legacy (likely non-functional) api/1 batchDelete call."""
+    path = state_path_for(config_path)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return {}
+
+
+def save_state(config_path, state):
+    path = state_path_for(config_path)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # API layer
 # ---------------------------------------------------------------------------
@@ -199,6 +224,13 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
         method = "POST"
         body = json.dumps(data)
 
+    if debug:
+        sys.stderr.write(f">>> {method} https://{cloud}/{api}/{api_url}\n")
+        if params:
+            sys.stderr.write(f">>> params: {json.dumps(params)}\n")
+        if body:
+            sys.stderr.write(f">>> body: {body}\n")
+
     try:
         resp = requests.request(
             method, f"https://{cloud}/{api}/{api_url}",
@@ -216,7 +248,7 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
         ) from e
 
     if debug:
-        sys.stderr.write(json.dumps(payload, indent=2) + "\n")
+        sys.stderr.write(f"<<< {json.dumps(payload, indent=2)}\n")
 
     result_code = payload.get("result_code") if isinstance(payload, dict) else None
     if resp.status_code >= 400 or (result_code is not None and result_code != 0):
@@ -243,13 +275,17 @@ def get_uid(cloud, token, debug=False):
     return _get(payload, "data", "uid")
 
 
-def do_list(cloud, token, limit=24, offset=0, debug=False):
+def _fetch_push_list(cloud, token, limit=100, offset=0, debug=False):
     payload = api_call(
         cloud, token, "push/message",
         params={"where": "{" f'"limit": {limit}, ' f'"offset": {offset}, ' '"parent": 0}'},
         debug=debug,
     )
-    files = payload.get("list", []) if isinstance(payload, dict) else []
+    return payload.get("list", []) if isinstance(payload, dict) else []
+
+
+def do_list(cloud, token, limit=24, offset=0, debug=False):
+    files = _fetch_push_list(cloud, token, limit=limit, offset=offset, debug=debug)
 
     rows = []
     for entry in files:
@@ -271,8 +307,95 @@ def do_list(cloud, token, limit=24, offset=0, debug=False):
     return rows
 
 
-def do_delete(cloud, token, ids, debug=False):
+def get_neocloud_cookie(cloud, token, debug=False):
+    """The actual device-facing storage is a Couchbase Sync Gateway instance
+    at /neocloud/ (confirmed by its CouchDB-style _revs_diff/_bulk_docs/
+    _local API and a 'SyncGatewaySession' cookie), completely separate from
+    the Bearer-token-authenticated api/1/* REST layer. users/syncToken is
+    itself a normal Bearer-authenticated call that hands back the session
+    id the browser then uses as that cookie -- so no browser/login flow is
+    needed to obtain it."""
+    payload = api_call(cloud, token, "users/syncToken", debug=debug)
+    return _get(payload, "data", "session_id")
+
+
+def neocloud_request(cloud, session_id, method, path, json_body=None,
+                       params=None, debug=False):
+    headers = {"Cookie": f"SyncGatewaySession={session_id}"}
+    body = None
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(json_body)
+
+    if debug:
+        sys.stderr.write(f">>> {method} https://{cloud}/neocloud/{path}\n")
+        if body:
+            sys.stderr.write(f">>> body: {body}\n")
+
+    try:
+        resp = requests.request(
+            method, f"https://{cloud}/neocloud/{path}",
+            headers=headers, params=params, data=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        raise BooxAPIError(f"network error calling neocloud/{path}: {e}") from e
+
+    try:
+        result = resp.json()
+    except ValueError as e:
+        raise BooxAPIError(
+            f"non-JSON response (HTTP {resp.status_code}) from neocloud/{path}: "
+            f"{resp.text[:200]}"
+        ) from e
+
+    if debug:
+        sys.stderr.write(f"<<< {json.dumps(result, indent=2)}\n")
+
+    if resp.status_code >= 400:
+        raise BooxAPIError(f"neocloud/{path} failed: HTTP {resp.status_code}: {result}")
+
+    return result
+
+
+def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
+    """Submit a proper CouchDB/Sync Gateway tombstone for a document we
+    know the real current revision of. current_rev is the bare hash part
+    (no 'N-' prefix) of the revision being deleted -- the new tombstone
+    revision becomes start+1 with that hash as its parent in _revisions."""
+    start, parent_hash = current_rev.split("-", 1)
+    new_hash = uuid.uuid4().hex
+    new_start = int(start) + 1
+
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    doc = {
+        "_deleted": True,
+        "_id": neocloud_id,
+        "_rev": f"{new_start}-{new_hash}",
+        "_revisions": {"start": new_start, "ids": [new_hash, parent_hash]},
+    }
+    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
+                      json_body={"docs": [doc], "new_edits": False}, debug=debug)
+
+
+def do_delete(cloud, token, ids, state, debug=False):
+    """Delete each id. For any id we have a tracked neocloud (id, rev) for
+    (i.e. it was sent by this tool's own 'send' since state-tracking was
+    added), submit a real tombstone to /neocloud/ first -- this is the
+    actual delivery layer, confirmed the same way 'send' was. Then call the
+    legacy api/1 batchDelete for account-listing parity either way. For
+    untracked ids (sent before this feature existed, or via the website),
+    only the legacy call happens -- deleting those from the device itself
+    isn't possible without first discovering their neocloud doc, which
+    isn't implemented."""
+    untracked = []
+    for _id in ids:
+        entry = state.get(_id)
+        if entry:
+            neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
+        else:
+            untracked.append(_id)
     api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
+    return untracked
 
 
 def do_send(cloud, token, filename, debug=False):
@@ -291,16 +414,23 @@ def do_send(cloud, token, filename, debug=False):
     access_key_secret = stss_data["AccessKeySecret"]
     security_token = stss_data["SecurityToken"]
 
-    auth = oss2.Auth(access_key_id, access_key_secret)
+    auth = oss2.StsAuth(access_key_id, access_key_secret, security_token)
     bucket = oss2.Bucket(auth, endpoint, bucket_name)
 
     _, extension = os.path.splitext(filename)
     remotename = f"{uid}/push/{uuid.uuid4()}{extension}"
-    token_headers = {"x-oss-security-token": security_token}
-    oss2.resumable_upload(bucket, remotename, filename, headers=token_headers)
+    oss2.resumable_upload(bucket, remotename, filename)
 
     basename = os.path.basename(filename)
-    api_call(
+    resource_type = extension.lstrip(".").lower() or "txt"
+
+    # saveAndPush's own response includes a 'cbMsg' field -- confirmed from
+    # a captured real session to be the actual /neocloud/ document it just
+    # wrote server-side (matching id used by ls/push/message). An earlier
+    # version of this tool additionally wrote its own separate neocloud
+    # doc before calling this, which was redundant and created an orphaned
+    # duplicate visible in the BOOXDrop web UI but not in `ls` -- removed.
+    result = api_call(
         cloud, token, "push/saveAndPush",
         data={
             "data": {
@@ -309,12 +439,19 @@ def do_send(cloud, token, filename, debug=False):
                 "parent": None,
                 "resourceDisplayName": basename,
                 "resourceKey": remotename,
-                "resourceType": "txt",
+                "resourceType": resource_type,
                 "title": basename,
             }
         },
         debug=debug,
     )
+
+    api1_id = _get(result, "data", "_id")
+    cb_msg = result.get("data", {}).get("cbMsg", {})
+    neocloud_id = cb_msg.get("id")
+    neocloud_rev = cb_msg.get("rev")
+
+    return api1_id, neocloud_id, neocloud_rev
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +516,17 @@ def cmd_send(config, config_path, filename, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
 
     def action(token):
-        do_send(cloud, token, filename, debug=debug)
+        return do_send(cloud, token, filename, debug=debug)
 
-    with_reauth(action, config, config_path, debug=debug)
+    result = with_reauth(action, config, config_path, debug=debug)
     print(f"sent: {os.path.basename(filename)}")
+
+    if result:
+        api1_id, neocloud_id, neocloud_rev = result
+        if api1_id and neocloud_id and neocloud_rev:
+            state = load_state(config_path)
+            state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
+            save_state(config_path, state)
 
 
 def cmd_ls(config, config_path, debug=False):
@@ -396,12 +540,28 @@ def cmd_ls(config, config_path, debug=False):
 
 def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+    state = load_state(config_path)
 
     def action(token):
-        do_delete(cloud, token, ids, debug=debug)
-        do_list(cloud, token, debug=debug)
+        return do_delete(cloud, token, ids, state, debug=debug)
 
-    with_reauth(action, config, config_path, debug=debug)
+    untracked = with_reauth(action, config, config_path, debug=debug)
+
+    for _id in ids:
+        state.pop(_id, None)
+    save_state(config_path, state)
+
+    print("deleted: " + ", ".join(ids))
+    if untracked:
+        print(
+            "note: no tracked neocloud revision for " + ", ".join(untracked) +
+            " (sent before this feature existed, or via the website) -- "
+            "only the legacy account-listing delete ran for these; they "
+            "may still be on the device. Use the BOOXDrop web UI's trash "
+            "icon for those."
+        )
+    print("(run 'my-boox ls' separately to confirm -- the list can lag "
+          "briefly right after a delete)")
 
 
 # ---------------------------------------------------------------------------
