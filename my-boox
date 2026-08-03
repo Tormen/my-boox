@@ -22,7 +22,7 @@ Juszkiewicz) into one file, with:
     my-* script conventions
 
 Usage:
-  my-boox [-D|--debug] [--config [PATH]] send FILE
+  my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]
   my-boox [-D|--debug] [--config [PATH]] ls|list
   my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
   my-boox --config [PATH]           # print resolved config path and exit
@@ -107,6 +107,7 @@ _bootstrap_venv()
 import configparser
 import json
 import locale
+import subprocess
 import time
 import uuid
 
@@ -131,6 +132,34 @@ cloud = eur.boox.com
 IGNORED_IDS = {
     "6a6e0015ca025b6e4826146f",  # 00.KEY...pdf, pre-fix fossil, no cbMsg
 }
+
+VERSION = "2.1"
+# Fallback for --version when git isn't available (e.g. this script was
+# copied somewhere without its .git directory). Update this to the actual
+# commit right when tagging a release. When git IS available, --version
+# prefers the live commit hash instead, so this only matters as a fallback.
+GIT_COMMIT_FALLBACK = "unknown"
+
+
+def _get_git_commit():
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "-C", script_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        commit = result.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", script_dir, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            commit += "-dirty"
+        return commit
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 class BooxAuthError(Exception):
@@ -426,33 +455,101 @@ def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
 
 
 def do_delete(cloud, token, ids, state, debug=False):
-    """Delete each id. For any id we have a tracked neocloud (id, rev) for
-    (i.e. it was sent by this tool's own 'send' since state-tracking was
-    added), submit a real tombstone to /neocloud/ using that. For untracked
-    ids, try discovering a current rev by looking up the api/1 id directly
-    as a neocloud id -- confirmed to be the same value for at least one
-    saveAndPush-created file. Only if that lookup 404s (genuinely not in
-    neocloud) do we fall back to the legacy-only, likely-ineffective
-    api/1 batchDelete call. Either way, batchDelete is also called for
-    account-listing parity."""
+    """Delete each id. do_send writes two /neocloud/ docs per file: its own
+    manual, independent document (tracked in state under the api1 id), plus
+    whatever saveAndPush creates server-side via cbMsg (whose id equals the
+    api1 id) -- so both are attempted for every id: the tracked one via
+    state, and the cbMsg one via discovery (looking up the api1 id directly
+    as a neocloud id). An id counts as untracked only if neither path finds
+    anything to delete."""
     truly_untracked = []
     session_id = None
     for _id in ids:
+        found_any = False
+
         entry = state.get(_id)
         if entry:
             neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
-            continue
+            found_any = True
 
         if session_id is None:
             session_id = get_neocloud_cookie(cloud, token, debug=debug)
         rev = neocloud_lookup_rev(cloud, session_id, _id, debug=debug)
         if rev:
             neocloud_delete_doc(cloud, token, _id, rev, debug=debug)
-        else:
+            found_any = True
+
+        if not found_any:
             truly_untracked.append(_id)
 
     api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
     return truly_untracked
+
+
+def neocloud_create_doc(cloud, session_id, uid, basename, resource_type,
+                          remotename, size, sign_url_fn, debug=False):
+    """Write the file's document to /neocloud/ as a brand-new, independent
+    document (own fresh id, revision 1) -- NOT a revision bump onto
+    saveAndPush's cbMsg doc. That bump approach was tried and failed twice
+    in a row with a 504 Gateway Timeout specifically on this write,
+    immediately after saveAndPush returned -- plausibly a race against
+    saveAndPush's own asynchronous backend replication, since bumping
+    depends on cbMsg's revision 1 already being fully committed server-
+    side, which this self-contained approach never depends on. Confirmed
+    reliable on-device delivery, at the cost of a second, orphaned
+    document with its own id showing as a duplicate row in the BOOXDrop
+    web UI (do_delete cleans up both)."""
+    neocloud_id = uuid.uuid4().hex
+    rev_hash = uuid.uuid4().hex
+    now_ms = int(time.time() * 1000)
+
+    content_obj = {
+        "_id": neocloud_id,
+        "createdAt": now_ms,
+        "distributeChannel": "onyx",
+        "formats": [resource_type],
+        "guid": neocloud_id,
+        "name": basename,
+        "ownerId": uid,
+        "size": size,
+        "md5": "",
+        "storage": {
+            resource_type: {
+                "oss": {
+                    "displayName": basename,
+                    "expires": 0,
+                    "key": remotename,
+                    "provider": "oss",
+                    "size": size,
+                    "url": sign_url_fn(remotename),
+                }
+            }
+        },
+        "title": basename,
+        "updatedAt": now_ms,
+    }
+    doc = {
+        "contentType": "digital_content",
+        "content": json.dumps(content_obj, separators=(",", ":")),
+        "msgType": 2,
+        "dbId": f"{uid}-MESSAGE",
+        "user": uid,
+        "name": basename,
+        "size": size,
+        "uniqueId": neocloud_id,
+        "createdAt": now_ms,
+        "updatedAt": now_ms,
+        "_id": neocloud_id,
+        "_rev": f"1-{rev_hash}",
+        "_revisions": {"start": 1, "ids": [rev_hash]},
+    }
+
+    neocloud_request(cloud, session_id, "POST", "_revs_diff",
+                      json_body={neocloud_id: [f"1-{rev_hash}"]}, debug=debug)
+    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
+                      json_body={"docs": [doc], "new_edits": False}, debug=debug)
+
+    return neocloud_id, f"1-{rev_hash}"
 
 
 def do_send(cloud, token, filename, debug=False):
@@ -480,13 +577,28 @@ def do_send(cloud, token, filename, debug=False):
 
     basename = os.path.basename(filename)
     resource_type = extension.lstrip(".").lower() or "txt"
+    size = os.path.getsize(filename)
 
-    # saveAndPush's own response includes a 'cbMsg' field -- confirmed from
-    # a captured real session to be the actual /neocloud/ document it just
-    # wrote server-side (matching id used by ls/push/message). An earlier
-    # version of this tool additionally wrote its own separate neocloud
-    # doc before calling this, which was redundant and created an orphaned
-    # duplicate visible in the BOOXDrop web UI but not in `ls` -- removed.
+    # Manual neocloud write FIRST (confirmed necessary for real device
+    # delivery), THEN saveAndPush -- this ordering and independence from
+    # saveAndPush's own write is what's actually confirmed reliable.
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    sign_url_fn = lambda key: bucket.sign_url(
+        "GET", key, 3 * 3600,
+        params={"response-content-disposition": "attachment"},
+    )
+    try:
+        manual_neocloud_id, manual_rev = neocloud_create_doc(
+            cloud, session_id, uid, basename, resource_type, remotename,
+            size, sign_url_fn, debug=debug,
+        )
+    except (BooxAPIError, BooxAuthError) as e:
+        raise BooxAPIError(
+            f"neocloud delivery write failed before saveAndPush even ran: "
+            f"{e} -- nothing was registered or delivered, safe to just "
+            f"retry 'send'"
+        ) from e
+
     result = api_call(
         cloud, token, "push/saveAndPush",
         data={
@@ -504,11 +616,8 @@ def do_send(cloud, token, filename, debug=False):
     )
 
     api1_id = _get(result, "data", "_id")
-    cb_msg = result.get("data", {}).get("cbMsg", {})
-    neocloud_id = cb_msg.get("id")
-    neocloud_rev = cb_msg.get("rev")
 
-    return api1_id, neocloud_id, neocloud_rev
+    return api1_id, manual_neocloud_id, manual_rev
 
 
 # ---------------------------------------------------------------------------
@@ -566,24 +675,42 @@ def with_reauth(action, config, config_path, debug=False):
 # Command handlers
 # ---------------------------------------------------------------------------
 
-def cmd_send(config, config_path, filename, debug=False):
-    filename = os.path.abspath(os.path.expanduser(filename))
-    if not os.path.isfile(filename):
-        die(f"my-boox: file not found: {filename}", 202)
+def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+    state = load_state(config_path)
+    failures = []
 
-    def action(token):
-        return do_send(cloud, token, filename, debug=debug)
+    for raw_filename in filenames:
+        filename = os.path.abspath(os.path.expanduser(raw_filename))
+        if not os.path.isfile(filename):
+            sys.stderr.write(f"my-boox: file not found: {filename}\n")
+            failures.append(raw_filename)
+            continue
 
-    result = with_reauth(action, config, config_path, debug=debug)
-    print(f"sent: {os.path.basename(filename)}")
+        def action(token, filename=filename):
+            return do_send(cloud, token, filename, debug=debug)
 
-    if result:
-        api1_id, neocloud_id, neocloud_rev = result
-        if api1_id and neocloud_id and neocloud_rev:
-            state = load_state(config_path)
-            state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
-            save_state(config_path, state)
+        try:
+            result = with_reauth(action, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: failed to send {os.path.basename(filename)}: {e}\n")
+            failures.append(raw_filename)
+            continue
+
+        print(f"sent: {os.path.basename(filename)}")
+
+        if result:
+            api1_id, neocloud_id, neocloud_rev = result
+            if api1_id and neocloud_id and neocloud_rev:
+                state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
+                save_state(config_path, state)
+
+    if failures:
+        die(
+            f"my-boox: {len(failures)} of {len(filenames)} failed: " +
+            ", ".join(failures),
+            204,
+        )
 
 
 def cmd_ls(config, config_path, debug=False):
@@ -627,12 +754,13 @@ def cmd_del(config, config_path, ids, debug=False):
 
 def print_usage(to=sys.stderr):
     to.write(
-        "usage: my-boox [-D|--debug] [--config [PATH]] send FILE\n"
+        "usage: my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]\n"
         "       my-boox [-D|--debug] [--config [PATH]] ls|list\n"
         "       my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]\n"
         "       my-boox --config [PATH]\n"
         "       my-boox --create-config [PATH]\n"
         "       my-boox --help\n"
+        "       my-boox --version\n"
     )
 
 
@@ -641,22 +769,28 @@ def print_help(to=sys.stdout):
 my-boox -- send, list, and delete files on an Onyx BOOX device via BOOXDrop.
 
 USAGE
-  my-boox [-D|--debug] [--config [PATH]] send FILE
+  my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]
   my-boox [-D|--debug] [--config [PATH]] ls|list
   my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
   my-boox --config [PATH]
   my-boox --create-config [PATH]
   my-boox --help
+  my-boox --version
 
 COMMANDS
-  send FILE        Upload FILE to your BOOXDrop account. It'll show up on
-                    the device under Storage/Push (BOOXDrop app -> Push tab).
+  send FILE [FILE...]
+                    Upload one or more files to your BOOXDrop account.
+                    Each shows up on the device under Storage/Push
+                    (BOOXDrop app -> Push tab). If one file in a batch
+                    fails, the rest are still attempted; failures are
+                    summarized at the end and the exit code is nonzero.
 
   ls, list         List files currently on your BOOXDrop account, with their
                     ID, size, and name. Use the ID with 'del'.
 
-  del ID [ID...]   Delete one or more files by ID (as shown by 'ls'), then
-                    print the resulting list.
+  del ID [ID...]   Delete one or more files by ID (as shown by 'ls').
+                    Confirms what was deleted; run 'ls' separately
+                    afterward if you want to see the resulting list.
 
 All three automatically handle authentication: if the stored token is
 missing, expired, or rejected by the server, my-boox requests a fresh
@@ -677,6 +811,7 @@ OPTIONS
                     it, or redirect it wherever you like) -- nothing is
                     written to disk in that case.
   -h, --help         Show this help and exit.
+  -V, --version      Show version and git commit, then exit.
 
 CONFIG
   my-boox reads a config file named 'my-boox.ini', in this format:
@@ -724,8 +859,10 @@ EXAMPLES
   my-boox --create-config ~/my-boox.ini  # write it there
   my-boox --config                     # where would my-boox look?
   my-boox send report.pdf
+  my-boox send a.pdf b.pdf c.pdf        # multiple files in one call
   my-boox ls
   my-boox del 6835ffbf89ac7242e1ada708
+  my-boox del 6835ffbf89ac7242e1ada708 6a6df289d2c1f36e5ee55b9d
   my-boox -D ls                        # with raw API responses on stderr
 
 EXIT CODES
@@ -764,6 +901,10 @@ def main(argv):
                 i += 1
         elif a in ("-h", "--help"):
             print_help(sys.stdout)
+            return 0
+        elif a in ("-V", "--version"):
+            commit = _get_git_commit() or GIT_COMMIT_FALLBACK
+            print(f"my-boox {VERSION} (commit {commit})")
             return 0
         else:
             rest.append(a)
@@ -804,23 +945,32 @@ def main(argv):
     config_path = config_override or resolve_config_path(required=False)
     config = load_config(config_path)
 
-    if cmd == "send":
-        if len(cmd_args) != 1:
-            sys.stderr.write("usage: my-boox send FILE\n")
-            return 201
-        cmd_send(config, config_path, cmd_args[0], debug=debug)
-        return 0
+    try:
+        if cmd == "send":
+            if not cmd_args:
+                sys.stderr.write("usage: my-boox send FILE [FILE...]\n")
+                return 201
+            cmd_send(config, config_path, cmd_args, debug=debug)
+            return 0
 
-    if cmd in ("ls", "list"):
-        cmd_ls(config, config_path, debug=debug)
-        return 0
+        if cmd in ("ls", "list"):
+            cmd_ls(config, config_path, debug=debug)
+            return 0
 
-    if cmd in ("del", "delete"):
-        if not cmd_args:
-            sys.stderr.write("usage: my-boox del ID [ID...]\n")
-            return 201
-        cmd_del(config, config_path, cmd_args, debug=debug)
-        return 0
+        if cmd in ("del", "delete"):
+            if not cmd_args:
+                sys.stderr.write("usage: my-boox del ID [ID...]\n")
+                return 201
+            cmd_del(config, config_path, cmd_args, debug=debug)
+            return 0
+    except (BooxAPIError, BooxAuthError) as e:
+        die(f"my-boox: {e}", 204)
+    except SystemExit:
+        raise
+    except Exception as e:
+        if debug:
+            raise
+        die(f"my-boox: unexpected error: {e} (rerun with -D for the full traceback)", 204)
 
     # unreachable given the KNOWN_CMDS check above
     return 201
