@@ -123,7 +123,39 @@ CONFIG_TEMPLATE = """[default]
 email =
 token =
 cloud = eur.boox.com
+send_pacing_seconds = 1.5
+send_retry_attempts = 3
+send_retry_delay_seconds = 3.0
+duplicate_check_on_send = true
 """
+
+# Defaults for the config keys above -- also used as load_config()'s
+# fallback values, so the template and the actual defaults can't drift
+# apart.
+SEND_BATCH_PACING = 1.5      # seconds between files in a multi-file send
+SEND_RETRY_ATTEMPTS = 3
+SEND_RETRY_BASE_DELAY = 3.0  # seconds; multiplied by attempt number
+
+
+def _config_float(config, key, default):
+    try:
+        return config["default"].getfloat(key, fallback=default)
+    except ValueError:
+        return default
+
+
+def _config_int(config, key, default):
+    try:
+        return config["default"].getint(key, fallback=default)
+    except ValueError:
+        return default
+
+
+def _config_bool(config, key, default):
+    try:
+        return config["default"].getboolean(key, fallback=default)
+    except ValueError:
+        return default
 
 # Phantom entries that push/message lists forever but which have no real
 # neocloud registration (no cbMsg field) and can't actually be removed --
@@ -200,6 +232,10 @@ def load_config(path):
     config["default"].setdefault("email", "")
     config["default"].setdefault("token", "")
     config["default"].setdefault("cloud", DEFAULT_CLOUD)
+    config["default"].setdefault("send_pacing_seconds", str(SEND_BATCH_PACING))
+    config["default"].setdefault("send_retry_attempts", str(SEND_RETRY_ATTEMPTS))
+    config["default"].setdefault("send_retry_delay_seconds", str(SEND_RETRY_BASE_DELAY))
+    config["default"].setdefault("duplicate_check_on_send", "true")
     return config
 
 
@@ -675,35 +711,94 @@ def with_reauth(action, config, config_path, debug=False):
 # Command handlers
 # ---------------------------------------------------------------------------
 
+def _send_with_retries(do_it, basename, attempts=SEND_RETRY_ATTEMPTS,
+                         base_delay=SEND_RETRY_BASE_DELAY):
+    """Retry a few times with backoff before giving up. Every failure seen
+    in practice sending real batches (502/504 from nginx, read timeouts)
+    has been transient backend flakiness under back-to-back requests, not
+    a real problem with any individual request -- so it's worth a few
+    automatic retries rather than immediately marking the file as failed."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return do_it()
+        except (BooxAPIError, BooxAuthError) as e:
+            last_err = e
+            if attempt < attempts:
+                delay = base_delay * attempt
+                sys.stderr.write(
+                    f"my-boox: {basename} failed (attempt {attempt}/{attempts}): "
+                    f"{e}\nmy-boox: retrying in {delay:.0f}s...\n"
+                )
+                time.sleep(delay)
+    raise last_err
+
+
 def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     state = load_state(config_path)
     failures = []
 
-    for raw_filename in filenames:
+    pacing = _config_float(config, "send_pacing_seconds", SEND_BATCH_PACING)
+    retry_attempts = _config_int(config, "send_retry_attempts", SEND_RETRY_ATTEMPTS)
+    retry_delay = _config_float(config, "send_retry_delay_seconds", SEND_RETRY_BASE_DELAY)
+    check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
+
+    existing = set()
+    if check_duplicates:
+        def fetch_existing(token):
+            return _fetch_push_list(cloud, token, debug=debug)
+
+        existing_entries = with_reauth(fetch_existing, config, config_path, debug=debug) or []
+        for entry in existing_entries:
+            args = entry.get("data", {}).get("args", {})
+            name, size = args.get("name"), args.get("size")
+            if name is not None and size is not None:
+                existing.add((name, size))
+
+    multi = len(filenames) > 1
+
+    for i, raw_filename in enumerate(filenames):
         filename = os.path.abspath(os.path.expanduser(raw_filename))
         if not os.path.isfile(filename):
             sys.stderr.write(f"my-boox: file not found: {filename}\n")
             failures.append(raw_filename)
             continue
 
+        basename = os.path.basename(filename)
+        size = os.path.getsize(filename)
+        if check_duplicates and (basename, size) in existing:
+            print(f"skipped: {basename} (already present, same name and size)")
+            continue
+
         def action(token, filename=filename):
             return do_send(cloud, token, filename, debug=debug)
 
+        def do_it():
+            return with_reauth(action, config, config_path, debug=debug)
+
         try:
-            result = with_reauth(action, config, config_path, debug=debug)
+            result = _send_with_retries(do_it, basename, attempts=retry_attempts,
+                                          base_delay=retry_delay)
         except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: failed to send {os.path.basename(filename)}: {e}\n")
+            sys.stderr.write(f"my-boox: failed to send {basename} after retries: {e}\n")
             failures.append(raw_filename)
             continue
 
-        print(f"sent: {os.path.basename(filename)}")
+        print(f"sent: {basename}")
+        if check_duplicates:
+            existing.add((basename, size))
 
         if result:
             api1_id, neocloud_id, neocloud_rev = result
             if api1_id and neocloud_id and neocloud_rev:
                 state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
                 save_state(config_path, state)
+
+        # pace requests in a multi-file batch -- back-to-back requests
+        # appear to trigger more 502/504s from Onyx's backend
+        if multi and i < len(filenames) - 1:
+            time.sleep(pacing)
 
     if failures:
         die(
@@ -781,8 +876,18 @@ COMMANDS
   send FILE [FILE...]
                     Upload one or more files to your BOOXDrop account.
                     Each shows up on the device under Storage/Push
-                    (BOOXDrop app -> Push tab). If one file in a batch
-                    fails, the rest are still attempted; failures are
+                    (BOOXDrop app -> Push tab). Skips any file whose name
+                    AND size already match something already on the
+                    account (checked once per batch, plus against files
+                    already sent earlier in the same batch) -- no
+                    duplicate uploads from re-running the same command.
+                    On a transient server error (502/504/timeout -- these
+                    happen even in the real web client), retries up to 3
+                    times with backoff before giving up on that one file.
+                    With more than one file, pauses briefly between each
+                    to avoid triggering more of those errors in the first
+                    place. If a file still fails after retries, the rest
+                    of the batch is still attempted; failures are
                     summarized at the end and the exit code is nonzero.
 
   ls, list         List files currently on your BOOXDrop account, with their
@@ -820,6 +925,10 @@ CONFIG
       email =
       token =
       cloud = eur.boox.com
+      send_pacing_seconds = 1.5
+      send_retry_attempts = 3
+      send_retry_delay_seconds = 3.0
+      duplicate_check_on_send = true
 
   email  -- the address tied to your Onyx account. Required: this is who
             re-auth emails a fresh verification code to.
@@ -828,6 +937,17 @@ CONFIG
   cloud  -- your BOOXDrop server region. 'eur.boox.com' for EU accounts,
             'push.boox.com' for US/VN. Matches the server shown on the
             device's own BOOXDrop / send2boox login screen.
+  send_pacing_seconds       -- pause between files in a multi-file send.
+            Onyx's backend throws more 502/504 errors under back-to-back
+            requests; this reduces how often that happens. 0 disables it.
+  send_retry_attempts       -- how many times to retry a file after a
+            transient server error before giving up on it.
+  send_retry_delay_seconds  -- base backoff delay between retries
+            (multiplied by the attempt number, so e.g. 3.0 gives 3s, 6s).
+  duplicate_check_on_send   -- true/false. When true (default), 'send'
+            fetches your current file list once per batch and skips any
+            file whose name AND size already match something already
+            there. Set false to always upload, even if a match exists.
 
   SEARCH ORDER (first match wins, no merging across locations):
       1. /LINKS/default/my-boox.ini

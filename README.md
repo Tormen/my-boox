@@ -93,12 +93,27 @@ Template:
 email =
 token =
 cloud = eur.boox.com
+send_pacing_seconds = 1.5
+send_retry_attempts = 3
+send_retry_delay_seconds = 3.0
+duplicate_check_on_send = true
 ```
 
 Fill in `email` with the address tied to your Onyx account. Leave `token`
 blank — it gets filled in automatically the first time you run a command
 and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 (`eur.boox.com` for EU, `push.boox.com` for US/VN).
+
+- `send_pacing_seconds` — pause between files in a multi-file `send`.
+  Onyx's backend throws more `502`/`504` errors under back-to-back
+  requests; this reduces how often that happens. `0` disables pacing.
+- `send_retry_attempts` — how many times to retry a file after a
+  transient server error before giving up on it.
+- `send_retry_delay_seconds` — base backoff delay between retries
+  (multiplied by the attempt number, so `3.0` gives 3s, then 6s).
+- `duplicate_check_on_send` — `true`/`false`. When `true` (default),
+  `send` skips any file whose name and size already match something on
+  your account. Set `false` to always upload regardless.
 
 ### Config file search order
 
@@ -134,6 +149,20 @@ my-boox del 6835ffbf89ac7242e1ada708 6a6df289d2c1f36e5ee55b9d
 With multiple files, `send` keeps going even if one fails (missing file, transient
 server error, etc.) — failures are summarized at the end and the exit code is
 nonzero if anything didn't make it, but the rest of the batch still gets sent.
+
+On a transient server error — `502`/`504`/read timeouts, which Onyx's own
+web client also hits occasionally — `send` retries that one file (3 times
+with backoff by default) before giving up on it. With more than one file,
+it also pauses briefly between each (1.5s by default) to reduce how often
+those errors happen in the first place. Both are configurable — see
+`send_retry_attempts`, `send_retry_delay_seconds`, and
+`send_pacing_seconds` under Configure above.
+
+`send` also skips any file whose name **and** size already match something
+already on your account — checked once per batch (plus against files already
+sent earlier in the same batch), so re-running the same command, or including
+the same file twice, doesn't create duplicate uploads. Set
+`duplicate_check_on_send = false` to turn this off.
 
 > **`del` fully works for anything sent by `my-boox` itself** (tracked via
 > a small `<config>.neocloud-state.json` file created alongside your config).
