@@ -99,13 +99,14 @@ Notable fixes and discoveries along the way:
     paged until a short page arrives. Steady state is still one request:
     nothing changed, so the first page is empty and short.
 
-  The gateway intermittently hangs ~15s on a `_changes` and returns `504`,
-  after which a retry answers in ~0.13s — the retry has never once been
-  slow. That looks like a request landing on a cold backend, so the first
-  retry now goes out **immediately** rather than sleeping the configured
-  backoff first. Bounding the feed with `limit` did *not* demonstrably stop
-  the hang; it is kept because it matches the browser and caps how much
-  work a single request can ask for.
+  The gateway intermittently hangs ~15s on a `_changes` and returns `504`.
+  A retry after the normal backoff answers in ~0.13s. Retrying
+  **immediately** was tried and measured *worse* — the immediate attempt
+  hung for another full ~15s and `504`d, and only the one after a pause
+  succeeded — so every retry waits, including the first. Bounding the feed
+  with `limit` did not demonstrably stop the hang either; it is kept
+  because it matches the browser and caps how much work one request can
+  ask for. The hang is server-side and self-healing; worst case is ~18s.
 
   Measured against a live account: 3-file `send` 15.7s, cold `ls` 3.7s,
   warm `ls` 0.57s, 3-file `del` 3 requests. Sent files were confirmed to
@@ -326,7 +327,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.2**.
+Current release: **v5.3**.
 
 ## Type checking
 

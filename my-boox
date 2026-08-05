@@ -307,7 +307,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.2"
+VERSION = "5.3"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -658,19 +658,20 @@ def _paced_request(method: str, url: str, headers: Optional[Dict[str, str]] = No
             last_err = BooxAPIError(f"HTTP {resp.status_code} from {url}")
 
         if attempt < attempts:
-            # The first retry goes out immediately: a 504 here means the
-            # request landed on a backend that hung, and every retry
-            # observed so far was answered in ~0.13s by another one.
-            # Backoff only starts mattering if that also fails.
-            delay = 0.0 if attempt == 1 else _api_retry_delay * (attempt - 1)
+            # Always wait before retrying, including the first time.
+            # Retrying a hung _changes IMMEDIATELY was tried in v5.2 and
+            # measured worse: the immediate attempt hung for another full
+            # ~15s and 504'd, and only the one after a ~3s pause answered
+            # (in 0.12s). Every fast retry on record had slept first, so the
+            # pause is doing the work -- the backend needs a moment, and
+            # hammering it straight away just lands in the same state.
+            delay = _api_retry_delay * attempt
             if debug:
                 sys.stderr.write(
                     f">>> request failed (attempt {attempt}/{attempts}): "
-                    f"{last_err}\n>>> retrying "
-                    f"{'immediately' if delay <= 0 else f'in {delay:.0f}s'}...\n"
+                    f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
                 )
-            if delay > 0:
-                time.sleep(delay)
+            time.sleep(delay)
 
     if not idempotent:
         raise BooxAPIError(
@@ -2959,9 +2960,11 @@ class TestRegressions(unittest.TestCase):
                 refresh_cache("example.invalid", "tok", cache_path)
         self.assertEqual(calls, ["_changes"])
 
-    # -- every retry observed against the real gateway answered in ~0.13s,
-    #    so sleeping 3s before the first one was pure waiting.
-    def test_first_retry_is_immediate_then_backs_off(self) -> None:
+    # -- v5.2 made the first retry immediate on the theory that the pause
+    #    bought nothing. Measured against the real gateway it was worse: the
+    #    immediate attempt hung another ~15s and 504'd, and only the attempt
+    #    after a pause succeeded. The delay stays.
+    def test_every_retry_waits_including_the_first(self) -> None:
         module = sys.modules[__name__]
         slept: List[float] = []
         stub = _FakeRequests([_FakeResponse(504, {}), _FakeResponse(504, {}),
@@ -2973,7 +2976,7 @@ class TestRegressions(unittest.TestCase):
              mock.patch.object(module.time, "sleep", lambda s: slept.append(s)):
             resp = _paced_request("GET", "https://example.invalid/x")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(slept, [3.0])   # nothing before retry 1; 3s before retry 2
+        self.assertEqual(slept, [3.0, 6.0])   # 3s before retry 1, 6s before retry 2
 
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
