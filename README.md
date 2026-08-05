@@ -8,13 +8,30 @@ on first run it creates its own virtualenv (under `~/.python.venv/my-boox`)
 and installs everything it needs into it, then re-execs itself under that
 interpreter.
 
+## v3.0 — breaking change, no backwards compatibility
+
+Earlier versions read and wrote Onyx's legacy `api/1/push/message` listing.
+That listing is confirmed to drift out of sync with reality — it keeps
+showing files long after they're genuinely deleted, and at least one file
+had a completely different id there than its real delivery-layer document.
+
+**v3.0 drops `push/message` entirely** and reads/writes `/neocloud/`
+directly (the actual Couchbase Sync Gateway instance that drives real
+device delivery), backed by a small local cache so `ls` stays fast. IDs
+from a v2.x `ls` do not work with this version.
+
+**If you used an earlier version, run the one-time cleanup first**
+(see [Migrating from v2.x](#migrating-from-v2x) below) before switching.
+
 ## Origin
 
 This started as a shell wrapper around
 [hrw/onyx-send2boox](https://github.com/hrw/onyx-send2boox) (MIT licensed,
 © 2022 Marcin Juszkiewicz), then absorbed and rewrote that project's logic
 directly (its `boox.py`, `send_file.py`, `obtain_token.py`,
-`request_verification_code.py`, and `delete_files.py`) into one file, with:
+`request_verification_code.py`, and `delete_files.py`) into one file.
+
+Notable fixes and discoveries along the way:
 
 - **Proper auth-failure detection.** The upstream code assumed a response
   shape and blew up with a raw `TypeError: 'NoneType' object is not
@@ -26,43 +43,38 @@ directly (its `boox.py`, `send_file.py`, `obtain_token.py`,
   auth failure, and always honors an explicit code over a stored token.
 - **Automatic re-authentication.** On an auth failure, it requests a fresh
   verification code, prompts you for it, obtains a new token, saves it, and
-  retries the action once — no more running three separate scripts by hand.
-- **Actual device delivery, not just account registration.** `saveAndPush`
-  alone only registers a file in the account's listing — confirmed by an
-  early test where a file sat registered for a long time without ever
-  reaching the device. Real delivery requires *also* writing the file's
-  document directly to `/neocloud/` (a Couchbase Sync Gateway instance
-  speaking a CouchDB-style replication protocol, which the device actually
-  replicates against) as a self-contained write, independent of whatever
-  `saveAndPush` does server-side. `send` does this manual write first,
-  then calls `saveAndPush`.
-  A cleaner-looking alternative was tried — instead of a separate document,
-  bumping a new revision directly onto the document `saveAndPush`'s own
-  `cbMsg` response says it already creates server-side, avoiding a second,
-  orphaned document entirely. It failed on two separate real attempts with
-  a `504 Gateway Timeout` on the immediate follow-up write, plausibly a
-  race against `saveAndPush`'s own asynchronous backend replication (the
-  self-contained approach never depends on anything `saveAndPush` just
-  wrote, so it doesn't hit this). Reverted in favor of the confirmed-
-  reliable version. Downside: creates a second, orphaned `/neocloud/`
-  document with its own id, visible as a duplicate row in the BOOXDrop web
-  UI (`ls` only shows the real one, via `push/message`) — `del` cleans up
-  both.
-- **`del` that actually works**, for anything sent by this tool. Using the
-  manually-created document's id/rev (saved to a small local state file
-  next to your config) *and* discovering `saveAndPush`'s own document (its
-  id equals the api/1 id), `del` submits real CouchDB/Sync Gateway
-  tombstones for both — not just the legacy `push/message/batchDelete` REST
-  call, which returns success but was confirmed (by waiting well over a
-  minute) to not actually remove anything on its own. Files sent before
-  this feature existed, or via the website, aren't in the state file, so
-  `del` on those only finds (at most) the `saveAndPush`-created document via
-  discovery — see the note in Use below.
-- **A separator line sized to your actual filenames**, not a fixed 57-dash
-  string.
-- **A fixed remote-filename bug**: the upstream code produced names like
-  `uuid4()..pdf` (double dot) because it kept the leading dot from
-  `os.path.splitext()` and added another one.
+  retries the action once.
+- **Real device delivery requires a direct `/neocloud/` write.** Calling
+  only `api/1/push/saveAndPush` (what the upstream project did) registers a
+  file in the account but doesn't reliably deliver it — confirmed by a
+  batch of 14 real files where none arrived on the device using that path
+  alone. `send` writes its own `/neocloud/` document directly.
+- **A repush-style reinforcement.** After the initial write, `send` bumps a
+  second revision onto that same document, mimicking exactly what the real
+  BOOXDrop web UI's own "repush" button does (confirmed from a captured
+  HAR — no `saveAndPush` call involved in a real repush at all, just a
+  revision bump). Safe to do here because it's bumping a document this
+  tool fully controls end to end — unlike an earlier abandoned attempt to
+  bump `saveAndPush`'s own separate, asynchronous document, which raced
+  against its own backend replication and failed with `504`s twice.
+- **A central pacing/retry layer.** Every outgoing request — across `send`,
+  `ls`, and `del` alike — goes through one function that paces requests and
+  retries transient failures (`502`/`503`/`504`, connection errors,
+  timeouts — these happen even in the real web client) with backoff,
+  configurable via `api_pacing_seconds`/`api_retry_attempts`/
+  `api_retry_delay_seconds`.
+- **`/neocloud/` as the sole source of truth (v3.0).** Cross-checking
+  against Onyx's legacy `push/message` listing repeatedly surfaced
+  divergence — entries that were actually already deleted, and at least
+  one file whose legacy id didn't match its real `/neocloud/` document id
+  at all. Rather than keep patching around that with fallback
+  reconciliation logic, v3.0 reads and writes `/neocloud/` directly via a
+  local incremental cache, so there's nothing left to diverge from.
+- **`saveAndPush` fully dropped from `send`.** Once `ls`/`del` no longer
+  read its listing at all, there was nothing left keeping it in the flow
+  besides caution — `send` now does the `/neocloud/` write and repush bump
+  only. This is newer and less battle-tested than the rest of this tool;
+  verify real on-device delivery before trusting a large batch to it.
 
 ## Install
 
@@ -79,6 +91,22 @@ The first run sets up `~/.python.venv/my-boox` automatically (installs
 `requests` and `oss2` into it) and re-execs itself under it. Every run
 after that is instant.
 
+## Migrating from v2.x
+
+Run the one-time cleanup script once, before using v3.0 for the first
+time. It deletes every live `/neocloud/` document and everything
+`push/message` still lists (both are wiped, since v3.0 doesn't track a
+mapping between the two), so you start from a genuinely empty, clean
+account rather than mixing old and new bookkeeping:
+
+```sh
+~/.python.venv/my-boox/bin/python3 cleanup_v3_migration.py "$(my-boox --config)"
+```
+
+**This permanently deletes data from your Onyx account — review the
+script first.** It also removes the old `<config>.neocloud-state.json`
+file, which v3.0 doesn't use.
+
 ## Configure
 
 ```sh
@@ -93,9 +121,9 @@ Template:
 email =
 token =
 cloud = eur.boox.com
-send_pacing_seconds = 1.5
-send_retry_attempts = 3
-send_retry_delay_seconds = 3.0
+api_pacing_seconds = 1.5
+api_retry_attempts = 3
+api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
 ```
 
@@ -104,12 +132,15 @@ blank — it gets filled in automatically the first time you run a command
 and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 (`eur.boox.com` for EU, `push.boox.com` for US/VN).
 
-- `send_pacing_seconds` — pause between files in a multi-file `send`.
-  Onyx's backend throws more `502`/`504` errors under back-to-back
-  requests; this reduces how often that happens. `0` disables pacing.
-- `send_retry_attempts` — how many times to retry a file after a
-  transient server error before giving up on it.
-- `send_retry_delay_seconds` — base backoff delay between retries
+- `api_pacing_seconds` — minimum interval between **any** two requests this
+  tool makes (`send`, `ls`, `del` alike, and every request within each of
+  them). Onyx's backend throws more `502`/`503`/`504` errors under
+  back-to-back requests; this reduces how often that happens. `0` disables
+  pacing.
+- `api_retry_attempts` — how many times to retry any single request after a
+  transient server error (`502`/`503`/`504`, connection errors, timeouts)
+  before giving up on it.
+- `api_retry_delay_seconds` — base backoff delay between retries
   (multiplied by the attempt number, so `3.0` gives 3s, then 6s).
 - `duplicate_check_on_send` — `true`/`false`. When `true` (default),
   `send` skips any file whose name and size already match something on
@@ -136,57 +167,44 @@ Or point at a specific file for one run:
 my-boox --config /path/to/other.ini ls
 ```
 
+## Local cache
+
+`<config path>.neocloud-cache.json` mirrors `/neocloud/`'s contents (id,
+name, size, revision, timestamps). `ls` refreshes it incrementally on
+every call — one cheap `_changes` request covering everything since the
+last known cursor, then a body fetch only for genuinely new or changed
+documents. The first `ls` after a clean slate pays the cost of fetching
+every file's body once; every call after that is cheap. Delete this file
+to force a full resync from scratch.
+
+`del` and `send` both update the cache directly rather than waiting for
+the next `ls`, so it stays accurate across a session.
+
 ## Use
 
 ```sh
 my-boox send some-document.pdf
 my-boox send a.pdf b.pdf c.pdf        # multiple files in one call
 my-boox ls
-my-boox del 6835ffbf89ac7242e1ada708
-my-boox del 6835ffbf89ac7242e1ada708 6a6df289d2c1f36e5ee55b9d
+my-boox del <id>
+my-boox del <id1> <id2>
 ```
 
-With multiple files, `send` keeps going even if one fails (missing file, transient
-server error, etc.) — failures are summarized at the end and the exit code is
-nonzero if anything didn't make it, but the rest of the batch still gets sent.
+With multiple files, `send` keeps going even if one fails (missing file,
+transient server error, etc.) — failures are summarized at the end and the
+exit code is nonzero if anything didn't make it, but the rest of the batch
+still gets sent.
 
-On a transient server error — `502`/`504`/read timeouts, which Onyx's own
-web client also hits occasionally — `send` retries that one file (3 times
-with backoff by default) before giving up on it. With more than one file,
-it also pauses briefly between each (1.5s by default) to reduce how often
-those errors happen in the first place. Both are configurable — see
-`send_retry_attempts`, `send_retry_delay_seconds`, and
-`send_pacing_seconds` under Configure above.
-
-`send` also skips any file whose name **and** size already match something
-already on your account — checked once per batch (plus against files already
-sent earlier in the same batch), so re-running the same command, or including
-the same file twice, doesn't create duplicate uploads. Set
-`duplicate_check_on_send = false` to turn this off.
-
-> **`del` fully works for anything sent by `my-boox` itself** (tracked via
-> a small `<config>.neocloud-state.json` file created alongside your config).
-> For files sent before this feature existed, or via the website, `del`
-> still only runs the legacy `push/message/batchDelete` call, which is
-> confirmed to *not* reliably remove the file from the device — use the
-> BOOXDrop web UI's trash icon for those instead. `del` tells you explicitly
-> when an id falls into this untracked category.
+`del` processes each id independently, printing `deleted: <id>` as soon as
+it's done. If one fails (even after retries), the rest of the batch still
+goes ahead rather than aborting, with a summary and nonzero exit code at
+the end if anything genuinely failed. A "not found" result is genuinely
+ambiguous between "already deleted" (common if you re-run `del` on the
+same id) and "never existed" — a deleted document returns the same `404`
+as one that never was — `del` won't overclaim which.
 
 Add `-D`/`--debug` to any command to see the raw JSON of every API call on
 stderr.
-
-The very first time you run any command with no token yet configured,
-you'll be walked through re-authentication automatically:
-
-```
-$ my-boox ls
-my-boox: auth failed, requesting a fresh verification code...
-Code for token requested. Check email.
-Check you@example.com for the 6-digit code, then enter it: 123456
-        ID               |    Size    | Name
--------------------------|------------|-------------------------
-6a6df289d2c1f36e5ee55b9d |         53 | colors.properties
-```
 
 ## Version
 
@@ -199,7 +217,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v2.1**.
+Current release: **v3.0**.
 
 ## Exit codes
 
