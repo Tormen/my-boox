@@ -44,26 +44,28 @@ Notable fixes and discoveries along the way:
 - **Automatic re-authentication.** On an auth failure, it requests a fresh
   verification code, prompts you for it, obtains a new token, saves it, and
   retries the action once.
-- **Both a direct `/neocloud/` write AND `saveAndPush` are required for
-  real device delivery** — neither alone is enough, confirmed by two
-  separate failed experiments:
-  - `saveAndPush` alone (what the upstream project did): registers a file
-    in the account but doesn't deliver it — confirmed by a batch of 14
-    real files where none arrived on the device using that path alone.
-  - The `/neocloud/` write alone, reinforced with a repush-style revision
-    bump (mimicking the real web UI's own "repush" button, confirmed from
-    a captured HAR to be just `_revs_diff` + `_bulk_docs` with no
-    `saveAndPush` call involved) instead of calling `saveAndPush`: also
-    registered cleanly with zero errors, but delivered 0 of 14 files. To
-    rule out flakiness as the cause, a **manual** repush click in the real
-    browser was also tested directly against files `send` had created —
-    it completed successfully server-side (confirmed by the response), and
-    still didn't deliver. So repush can only re-trigger delivery of
-    something already fully registered via `saveAndPush` at least once —
-    it's not a substitute for that first registration.
+- **The exact call sequence the BOOXDrop web client uses**, taken from HAR
+  captures of a working browser upload and delete:
 
-  `send` therefore does both: its own `/neocloud/` write, then
-  `saveAndPush`. No repush step.
+  | command | sequence |
+  | --- | --- |
+  | `send` | OSS upload (https) → `_revs_diff` → `_bulk_docs` (`new_edits=false`) → `push/saveAndPush` **with `cbMsg`** naming that document |
+  | `del` | `_revs_diff` → `_bulk_docs` tombstone → `push/message/batchDelete` with the same id |
+
+  Both halves of each are load-bearing:
+
+  - **`cbMsg` on `saveAndPush`** is what makes the server *adopt* the
+    document we just wrote instead of registering a second one of its own.
+    Omitting it produced two `/neocloud/` documents per file (two rows in
+    the web UI, one row here only because `ls` grouped them) — and a
+    delete that removed one and left the other. With it, one file is one
+    document, exactly as in the browser.
+  - **`batchDelete`** removes the paired push-message record. The
+    `/neocloud/` tombstone alone leaves it behind.
+
+  Files sent by a pre-v4.0 `my-boox` still carry that stray second
+  document. `ls` groups by (name, size) so they show as one row, and `del`
+  expands each id to its whole group, so both go.
 - **A central pacing/retry layer.** Every outgoing request — across `send`,
   `ls`, and `del` alike — goes through one function that paces requests and
   retries transient failures (`502`/`503`/`504`, connection errors,
@@ -120,7 +122,7 @@ file, which v3.0 doesn't use.
 
 ```sh
 my-boox --create-config              # print a template to stdout
-my-boox --create-config ~/my-boox.ini # write it to a specific path
+my-boox --create-config ~/.my-boox.conf # write it to a specific path
 ```
 
 Template:
@@ -155,6 +157,13 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 - `duplicate_check_on_send` — `true`/`false`. When `true` (default),
   `send` skips any file whose name and size already match something on
   your account. Set `false` to always upload regardless.
+- `send_skip_optional_calls` — `true`/`false`, default `false`. `send`
+  makes two calls (`users/getDevice`, `im/getSig`) whose responses are
+  discarded; they exist only because the upstream project mirrored the web
+  client's sequence. Setting this `true` skips them, saving two requests
+  (and two pacing intervals) per file. **Unverified** — a similarly
+  redundant-looking call (`saveAndPush`) turned out to be required for
+  delivery, so test on-device before trusting it for a real batch.
 - `cache_path` — where the local `/neocloud/` mirror is kept. Blank
   (default) uses `<this config file's path>.neocloud-cache.json`. Set an
   absolute path to use somewhere else — e.g. to share one cache across
@@ -163,14 +172,23 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 
 ### Config file search order
 
-`my-boox` looks for `my-boox.ini` in, in this order:
+`my-boox` looks for its config in this order:
 
-1. `/LINKS/default/`
-2. `~/`
-3. `/etc/`
-4. `/usr/local/etc/`
+0. `$MY_BOOX_CONFIG`, if set and non-empty — wins outright
+1. `/LINKS/default/my-boox.conf`
+2. `~/.my-boox.conf` — **dot-prefixed**, home only
+3. `/etc/my-boox.conf`
+4. `/usr/local/etc/my-boox.conf`
 
-First match wins. Check where it's currently resolving to:
+First match wins; running a command with no config anywhere exits `206`.
+A `--config PATH` naming a file that doesn't exist also exits `206` rather
+than silently falling back to the search.
+
+The config stores your account `token`, which is a full credential — anything
+that can read the file can send to and delete from your device. `my-boox`
+writes it `0600`. Tighten an older one with `chmod 600 ~/.my-boox.conf`.
+
+Check where it's currently resolving to:
 
 ```sh
 my-boox --config
@@ -253,18 +271,18 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v3.2**.
+Current release: **v4.0**.
 
 ## Exit codes
 
 | Code | Meaning |
-|------|---------|
-| 201  | wrong usage / missing arg / unknown command |
-| 202  | file not found (`send`) |
-| 203  | venv bootstrap failed |
-| 204  | action failed even after re-auth retry |
-| 205  | re-auth step itself failed (no email configured, no code entered, request-code or obtain-token call failed) |
-| 206  | no config file found and none could be resolved |
+| --- | --- |
+| 201 | wrong usage / missing arg / unknown command / refused to overwrite an existing file |
+| 202 | `send`: every failure was a locally missing file (if anything else failed too, 204 wins) |
+| 203 | a dependency (`requests`, `oss2`) is missing — the managed venv is absent or half-built |
+| 204 | action failed even after re-auth retry, or a file failed to upload |
+| 205 | re-auth step itself failed (no email configured, no code entered, stdin not a terminal, or the request-code/obtain-token call failed) |
+| 206 | no config file found, or the `--config PATH` given does not exist |
 
 ## License
 

@@ -21,11 +21,13 @@ version. Run the one-time cleanup script (see README) before switching.
     verification code, prompts for it, obtains a new token, saves it, and
     retries the action once
   - a central pacing/retry layer every outgoing request goes through
-  - `send` writes its own /neocloud/ document (confirmed necessary for real
-    delivery) and calls api/1/push/saveAndPush (also confirmed necessary --
-    a version that substituted a repush-style bump instead delivered 0 of
-    14 files, even after a genuinely successful manual repush via the real
-    web UI, so saveAndPush stays in the flow)
+  - send and del follow the BOOXDrop web client's own call sequence, taken
+    from a HAR capture of a working browser upload and delete:
+      send: OSS upload -> _revs_diff -> _bulk_docs (new_edits=false) ->
+            push/saveAndPush WITH cbMsg naming that document, so the
+            server adopts it rather than registering a second one
+      del:  _revs_diff -> _bulk_docs tombstone ->
+            push/message/batchDelete for the same id
   - a self-managed virtualenv under ~/.python.venv/my-boox (created and
     populated with its two dependencies -- requests, oss2 -- on first run;
     this script re-execs itself under that interpreter automatically)
@@ -33,14 +35,16 @@ version. Run the one-time cleanup script (see README) before switching.
     my-* script conventions
 
 Usage:
-  my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]
-  my-boox [-D|--debug] [--config [PATH]] ls|list
-  my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
-  my-boox --config [PATH]           # print resolved config path and exit
-  my-boox --create-config [PATH]    # print (or write) a template config
+  my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]
+  my-boox [-D|--debug] [--config PATH] ls|list
+  my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]
+  my-boox [--config [PATH]]         # print resolved config path and exit
+  my-boox [--create-config [PATH]]  # print (or write) a template config
 
-Config search order (first match wins): /LINKS/default/ -> ~/ -> /etc/ ->
-/usr/local/etc/, filename my-boox.ini. Config format:
+Config search order (first match wins): $MY_BOOX_CONFIG -> /LINKS/default/
+-> ~/.my-boox.conf -> /etc/ -> /usr/local/etc/, filename my-boox.conf
+(dot-prefixed in home only). The file is
+written 0600 because it stores the account token. Config format:
 
   [default]
   email =
@@ -48,17 +52,32 @@ Config search order (first match wins): /LINKS/default/ -> ~/ -> /etc/ ->
   cloud = eur.boox.com
 
 err codes:
-  201  wrong usage / missing arg / unknown command
-  202  file not found (send only)
-  203  venv bootstrap failed
-  204  action failed even after re-auth retry
+  201  wrong usage / missing arg / unknown command / refused to overwrite
+  202  send: every failure was a locally missing file
+  203  a dependency (requests, oss2) is missing -- venv absent or partial
+  204  action failed even after re-auth retry, or a file failed to upload
   205  re-auth step itself failed (no email configured / no code entered /
-       request-code or obtain-token call failed)
-  206  no config file found and none could be resolved
+       stdin not a terminal / request-code or obtain-token call failed)
+  206  no config file found, or the --config PATH given does not exist
 """
 
+import contextlib
+import io
 import os
 import sys
+import tempfile
+import unittest
+from unittest import mock
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - exercised in test mode without deps
+    requests = None
+
+try:
+    import oss2
+except ImportError:  # pragma: no cover - exercised in test mode without deps
+    oss2 = None
 
 
 def die(msg, code=1):
@@ -78,9 +97,35 @@ def die(msg, code=1):
 VENV_DIR = os.path.expanduser("~/.python.venv/my-boox")
 _VENV_MARKER = "_MY_BOOX_VENV_ACTIVE"
 
+# Defined up here (rather than beside the other constants further down)
+# because _should_skip_venv_bootstrap() runs before that point.
+KNOWN_CMDS = {"send", "ls", "list", "del", "delete"}
+
+
+def _should_skip_venv_bootstrap(argv=None):
+    """The venv exists solely for `requests` and `oss2`, which only the
+    network commands need -- so anything that never goes near the network
+    (--help, --version, --run-tests, and the purely informational or
+    config-writing flag forms) can run under the ambient interpreter.
+
+    The decision keys off whether a COMMAND is present, never off which
+    flags are present. Keying it off the flags meant `--config PATH ls`
+    skipped the bootstrap while still needing `requests`, and every such
+    run died with "'NoneType' object has no attribute 'RequestException'"."""
+    args = sys.argv[1:] if argv is None else argv
+    if any(arg == "--run-tests" or arg.startswith("--run-tests=") for arg in args):
+        return True
+    if any(arg in ("-h", "--help", "-V", "--version") for arg in args):
+        return True
+    return not any(arg in KNOWN_CMDS for arg in args)
+
 
 def _bootstrap_venv():
     if os.environ.get(_VENV_MARKER) == "1":
+        return
+
+    if _should_skip_venv_bootstrap():
+        os.environ[_VENV_MARKER] = "1"
         return
 
     import subprocess
@@ -99,10 +144,15 @@ def _bootstrap_venv():
                  "requests", "oss2>=2.16"]
             )
         except subprocess.CalledProcessError as e:
-            die(f"my-boox: venv bootstrap failed ({e}); "
-                f"remove {VENV_DIR} and retry, or check network access", 203)
+            sys.stderr.write(
+                f"my-boox: venv bootstrap unavailable ({e}); continuing without the managed venv for this run\n"
+            )
+            os.environ[_VENV_MARKER] = "1"
+            return
         except OSError as e:
-            die(f"my-boox: venv bootstrap failed ({e})", 203)
+            sys.stderr.write(f"my-boox: venv bootstrap unavailable ({e}); continuing without the managed venv for this run\n")
+            os.environ[_VENV_MARKER] = "1"
+            return
 
     os.environ[_VENV_MARKER] = "1"
     os.execv(python_bin, [python_bin] + sys.argv)
@@ -117,18 +167,42 @@ _bootstrap_venv()
 
 import configparser
 import json
+import calendar
 import locale
 import subprocess
 import time
 import uuid
 
-import requests
-import oss2
-
 DEFAULT_CLOUD = "eur.boox.com"
-CONFIG_FILENAME = "my-boox.ini"
-CONFIG_SEARCH_DIRS = ["/LINKS/default", os.path.expanduser("~"), "/etc", "/usr/local/etc"]
-KNOWN_CMDS = {"send", "ls", "list", "del", "delete"}
+CONFIG_NAME = "my-boox.conf"
+# Note the home entry is dot-prefixed and the others are not -- that is the
+# convention these my-* tools follow, so the search is over full paths
+# rather than a single filename joined onto a list of directories.
+CONFIG_SEARCH_PATHS = [
+    os.path.join("/LINKS/default", CONFIG_NAME),
+    os.path.join(os.path.expanduser("~"), "." + CONFIG_NAME),
+    os.path.join("/etc", CONFIG_NAME),
+    os.path.join("/usr/local/etc", CONFIG_NAME),
+]
+CONFIG_ENV_VAR = "MY_BOOX_CONFIG"
+# KNOWN_CMDS is defined above, next to the venv bootstrap that needs it.
+
+
+def _require_deps():
+    """Fail loudly and early if the managed venv is missing or half-built.
+    Without this the first network call reaches `requests.request` with
+    `requests` still None and reports "'NoneType' object has no attribute
+    'RequestException'", which says nothing about the actual problem."""
+    missing = [name for name, mod in (("requests", requests), ("oss2", oss2))
+               if mod is None]
+    if missing:
+        die(
+            "my-boox: missing dependenc" +
+            ("ies: " if len(missing) > 1 else "y: ") + ", ".join(missing) +
+            f" -- the managed venv at {VENV_DIR} is absent or incomplete. "
+            f"Remove that directory and re-run to rebuild it.",
+            203,
+        )
 
 CONFIG_TEMPLATE = """[default]
 email =
@@ -138,6 +212,7 @@ api_pacing_seconds = 1.5
 api_retry_attempts = 3
 api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
+send_skip_optional_calls = false
 cache_path =
 
 # cache_path: where the local /neocloud/ mirror is kept. Leave blank to
@@ -192,7 +267,7 @@ def _config_bool(config, key, default):
         return default
 
 
-VERSION = "3.2"
+VERSION = "4.0"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -237,17 +312,34 @@ class BooxAPIError(Exception):
 # ---------------------------------------------------------------------------
 
 def resolve_config_path(required=False):
-    for d in CONFIG_SEARCH_DIRS:
-        p = os.path.join(d, CONFIG_FILENAME)
+    """$MY_BOOX_CONFIG wins outright (the escape hatch for tests and cron),
+    otherwise the first existing file in the documented search order."""
+    env_path = os.environ.get(CONFIG_ENV_VAR, "").strip()
+    if env_path:
+        env_path = os.path.expanduser(env_path)
+        # Checked here rather than trusted: an env var pointing at a file
+        # that isn't there is a mistake worth naming, not a reason to fall
+        # through to an empty config and fail later with the much vaguer
+        # "no email configured".
+        if required and not os.path.isfile(env_path):
+            die(
+                f"my-boox: ${CONFIG_ENV_VAR} points at a file that does not "
+                f"exist: {env_path}",
+                206,
+            )
+        return env_path
+
+    for p in CONFIG_SEARCH_PATHS:
         if os.path.isfile(p):
             return p
     if required:
         die(
-            "my-boox: no config found in " + ", ".join(CONFIG_SEARCH_DIRS) +
-            " -- run 'my-boox --create-config' to create one",
+            "my-boox: no config found. Searched: " + ", ".join(CONFIG_SEARCH_PATHS) +
+            f" (and ${CONFIG_ENV_VAR} is unset)"
+            f" -- run 'my-boox --create-config ~/.{CONFIG_NAME}' to create one",
             206,
         )
-    return os.path.join(CONFIG_SEARCH_DIRS[0], CONFIG_FILENAME)
+    return CONFIG_SEARCH_PATHS[0]
 
 
 def load_config(path):
@@ -263,16 +355,41 @@ def load_config(path):
     config["default"].setdefault("api_retry_attempts", str(DEFAULT_RETRY_ATTEMPTS))
     config["default"].setdefault("api_retry_delay_seconds", str(DEFAULT_RETRY_DELAY))
     config["default"].setdefault("duplicate_check_on_send", "true")
+    config["default"].setdefault("send_skip_optional_calls", "false")
     config["default"].setdefault("cache_path", "")
     return config
 
 
+def _write_file_atomic(path, text, mode=0o600):
+    """Write via a temp file in the same directory, then rename over the
+    target. Both files this tool owns are rewritten while it is mid-flight
+    (the config every time a token is refreshed, the cache after every
+    delete), and a plain truncate-then-write leaves a zero-length or
+    half-written file behind if the run is interrupted there. The rename
+    is atomic, so a reader sees either the old file or the new one."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent,
+                               prefix="." + os.path.basename(path) + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def save_config(path, config):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
-        config.write(f)
+    # 0600: this file holds the account token, which is a full credential
+    # for the BOOX account -- anything that can read it can send to and
+    # delete from the device.
+    buf = io.StringIO()
+    config.write(buf)
+    _write_file_atomic(path, buf.getvalue(), mode=0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -303,16 +420,57 @@ def load_cache(cache_path):
 
 
 def save_cache(cache_path, cache):
-    parent = os.path.dirname(cache_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump(cache, f, indent=2)
+    _write_file_atomic(cache_path, json.dumps(cache, indent=2) + "\n", mode=0o600)
 
 
 # ---------------------------------------------------------------------------
 # API layer
 # ---------------------------------------------------------------------------
+
+# Response and request fields that are credentials in their own right.
+# 'code' is the emailed verification code, 'token'/'session_id' are the two
+# things that authenticate every call this tool makes, and the STS triple
+# is a live write capability on the OSS bucket.
+_SECRET_KEYS = frozenset({
+    "token", "session_id", "code", "sign", "userSig",
+    "AccessKeyId", "AccessKeySecret", "SecurityToken",
+})
+
+
+def _redact(obj):
+    """Mask credential values in anything about to be printed by -D.
+
+    Debug output is the thing that gets redirected to a file and pasted
+    into a bug report; unredacted, a single `my-boox -D ls` writes a
+    working session_id to disk, and `-D` during a re-auth writes the
+    account token itself. Values are replaced with a length marker so the
+    output still shows whether a field was present and plausible."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _SECRET_KEYS and isinstance(v, str) and v:
+                out[k] = f"<redacted {len(v)} chars>"
+            elif k == "url" and isinstance(v, str) and "Signature=" in v:
+                # Pre-signed OSS URL: the path identifies the file (useful
+                # when debugging), the query string is the capability.
+                out[k] = v.split("?", 1)[0] + "?<redacted signature>"
+            else:
+                out[k] = _redact(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
+def _debug_json(obj):
+    """json.dumps for -D output, with credentials masked. Falls back to a
+    plain repr if the payload isn't JSON-serializable -- a debug printer
+    must never be the thing that raises."""
+    try:
+        return json.dumps(_redact(obj), indent=2)
+    except (TypeError, ValueError):
+        return repr(obj)
+
 
 def _get(d, *keys):
     cur = d
@@ -347,7 +505,12 @@ def _paced_request(method, url, headers=None, params=None, data=None,
     returned as-is on the first try; interpreting them is the caller's job."""
     global _LAST_REQUEST_TIME
     last_err = None
-    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+    # Clamped: a config with api_retry_attempts = 0 (or a negative) used to
+    # skip the loop entirely and fall through to `raise last_err` with
+    # last_err still None -- "TypeError: exceptions must derive from
+    # BaseException", from a request that was never actually attempted.
+    attempts = max(1, API_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
         if API_PACING > 0:
             wait = API_PACING - (time.monotonic() - _LAST_REQUEST_TIME)
             if wait > 0:
@@ -364,11 +527,11 @@ def _paced_request(method, url, headers=None, params=None, data=None,
                 return resp
             last_err = BooxAPIError(f"HTTP {resp.status_code} from {url}")
 
-        if attempt < API_RETRY_ATTEMPTS:
+        if attempt < attempts:
             delay = API_RETRY_DELAY * attempt
             if debug:
                 sys.stderr.write(
-                    f">>> request failed (attempt {attempt}/{API_RETRY_ATTEMPTS}): "
+                    f">>> request failed (attempt {attempt}/{attempts}): "
                     f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
                 )
             time.sleep(delay)
@@ -395,9 +558,9 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
     if debug:
         sys.stderr.write(f">>> {method} {url}\n")
         if params:
-            sys.stderr.write(f">>> params: {json.dumps(params)}\n")
-        if body:
-            sys.stderr.write(f">>> body: {body}\n")
+            sys.stderr.write(f">>> params: {_debug_json(params)}\n")
+        if data:
+            sys.stderr.write(f">>> body: {_debug_json(data)}\n")
 
     resp = _paced_request(method, url, headers=headers, params=params,
                             data=body, debug=debug)
@@ -411,11 +574,27 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
         ) from e
 
     if debug:
-        sys.stderr.write(f"<<< {json.dumps(payload, indent=2)}\n")
+        sys.stderr.write(f"<<< {_debug_json(payload)}\n")
 
-    result_code = payload.get("result_code") if isinstance(payload, dict) else None
-    if resp.status_code >= 400 or (result_code is not None and result_code != 0):
-        msg = payload.get("message", f"HTTP {resp.status_code}") if isinstance(payload, dict) else f"HTTP {resp.status_code}"
+    if isinstance(payload, dict):
+        result_code = payload.get("result_code")
+        msg = payload.get("message") or f"HTTP {resp.status_code}"
+    else:
+        result_code = None
+        msg = f"HTTP {resp.status_code}"
+
+    # Only a credential-shaped failure may raise BooxAuthError, because
+    # that is what triggers the re-auth flow -- which emails a fresh code
+    # and blocks on a prompt for it. A 404 or a 400 is a bug or an outage,
+    # and no new token will fix either; interrogating the user for a
+    # verification code over one is pure noise.
+    if resp.status_code in (401, 403):
+        raise BooxAuthError(f"{api_url} failed: {msg}")
+    if resp.status_code >= 400:
+        raise BooxAPIError(f"{api_url} failed: HTTP {resp.status_code}: {msg}")
+    # A 200 carrying a nonzero result_code is the shape Onyx uses for an
+    # expired/rejected token, so this one stays on the re-auth path.
+    if result_code is not None and result_code != 0:
         raise BooxAuthError(f"{api_url} failed: {msg}")
 
     return payload
@@ -433,9 +612,24 @@ def do_obtain_token(cloud, email, code, debug=False):
     return _get(payload, "data", "token")
 
 
+# Per-process caches for values that provably don't change within a single
+# invocation. Keyed by (cloud, token) so a mid-run re-auth (which swaps the
+# token) naturally invalidates them rather than reusing stale state.
+# This matters a lot: at the default 1.5s pacing, every avoided request is
+# 1.5s off the wall clock, and a naive send re-fetched all of these once
+# per file.
+_UID_CACHE = {}
+_SESSION_CACHE = {}
+_BUCKETS_CACHE = {}
+_STSS_CACHE = {}
+
+
 def get_uid(cloud, token, debug=False):
-    payload = api_call(cloud, token, "users/me", debug=debug)
-    return _get(payload, "data", "uid")
+    key = (cloud, token)
+    if key not in _UID_CACHE:
+        payload = api_call(cloud, token, "users/me", debug=debug)
+        _UID_CACHE[key] = _get(payload, "data", "uid")
+    return _UID_CACHE[key]
 
 
 def get_neocloud_cookie(cloud, token, debug=False):
@@ -445,9 +639,54 @@ def get_neocloud_cookie(cloud, token, debug=False):
     from the Bearer-token-authenticated api/1/* REST layer. users/syncToken
     is itself a normal Bearer-authenticated call that hands back the
     session id the browser then uses as that cookie -- so no browser/login
-    flow is needed to obtain it."""
-    payload = api_call(cloud, token, "users/syncToken", debug=debug)
-    return _get(payload, "data", "session_id")
+    flow is needed to obtain it.
+
+    Cached per process: the returned session_id is stable (it carries its
+    own multi-week 'expires'), and re-fetching it before every neocloud
+    call was costing a full pacing interval each time."""
+    key = (cloud, token)
+    if key not in _SESSION_CACHE:
+        payload = api_call(cloud, token, "users/syncToken", debug=debug)
+        _SESSION_CACHE[key] = _get(payload, "data", "session_id")
+    return _SESSION_CACHE[key]
+
+
+def get_buckets(cloud, token, debug=False):
+    """Static per-account bucket/endpoint config -- cached per process."""
+    key = (cloud, token)
+    if key not in _BUCKETS_CACHE:
+        payload = api_call(cloud, token, "config/buckets", debug=debug)
+        _BUCKETS_CACHE[key] = _get(payload, "data", "onyx-cloud")
+    return _BUCKETS_CACHE[key]
+
+
+def get_stss(cloud, token, debug=False):
+    """Short-lived STS upload credentials. Unlike the others these really do
+    expire (the response carries an 'Expiration'), so they're cached only
+    until shortly before that, then re-fetched. Falls back to always
+    re-fetching if the expiry can't be parsed -- correctness over speed."""
+    key = (cloud, token)
+    cached = _STSS_CACHE.get(key)
+    if cached:
+        data, expires_at = cached
+        if expires_at is not None and time.time() < expires_at - 300:
+            return data
+
+    payload = api_call(cloud, token, "config/stss", debug=debug)
+    data = _get(payload, "data")
+
+    expires_at = None
+    raw = data.get("Expiration")
+    if raw:
+        try:
+            expires_at = calendar.timegm(
+                time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+            )
+        except (ValueError, TypeError):
+            expires_at = None
+
+    _STSS_CACHE[key] = (data, expires_at)
+    return data
 
 
 def neocloud_request(cloud, session_id, method, path, json_body=None,
@@ -461,8 +700,8 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
     url = f"https://{cloud}/neocloud/{path}"
     if debug:
         sys.stderr.write(f">>> {method} {url}\n")
-        if body:
-            sys.stderr.write(f">>> body: {body}\n")
+        if json_body is not None:
+            sys.stderr.write(f">>> body: {_debug_json(json_body)}\n")
 
     resp = _paced_request(method, url, headers=headers, params=params,
                             data=body, debug=debug)
@@ -476,7 +715,7 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
         ) from e
 
     if debug:
-        sys.stderr.write(f"<<< {json.dumps(result, indent=2)}\n")
+        sys.stderr.write(f"<<< {_debug_json(result)}\n")
 
     if resp.status_code >= 400:
         raise BooxAPIError(f"neocloud/{path} failed: HTTP {resp.status_code}: {result}")
@@ -511,7 +750,7 @@ def neocloud_get_doc(cloud, session_id, neocloud_id, debug=False):
         ) from e
 
     if debug:
-        sys.stderr.write(f"<<< {json.dumps(result, indent=2)}\n")
+        sys.stderr.write(f"<<< {_debug_json(result)}\n")
 
     if resp.status_code >= 400:
         raise BooxAPIError(f"neocloud/{neocloud_id} lookup failed: HTTP {resp.status_code}: {result}")
@@ -527,9 +766,15 @@ def neocloud_delete_doc(cloud, session_id, neocloud_id, current_rev, debug=False
     already have one (e.g. do_delete_one, which needs one anyway to look
     up the current rev) don't pay for a second redundant users/syncToken
     call."""
-    start, parent_hash = current_rev.split("-", 1)
+    try:
+        start, parent_hash = str(current_rev).split("-", 1)
+        new_start = int(start) + 1
+    except ValueError as e:
+        raise BooxAPIError(
+            f"cannot delete {neocloud_id}: unparseable revision "
+            f"{current_rev!r} (expected '<int>-<hash>')"
+        ) from e
     new_hash = uuid.uuid4().hex
-    new_start = int(start) + 1
 
     doc = {
         "_deleted": True,
@@ -595,9 +840,10 @@ def refresh_cache(cloud, token, cache_path, debug=False):
 def neocloud_write_doc(cloud, session_id, doc_id, rev_str, revisions, uid,
                          basename, resource_type, remotename, size,
                          sign_url_fn, debug=False):
-    """Shared low-level write used by both the initial create (rev 1) and
-    the repush-style bump (rev 2+) -- same document shape either way,
-    only _rev/_revisions differ."""
+    """Write one /neocloud/ document, in the exact shape the web client
+    posts (verified field-for-field against a HAR of a browser upload):
+    _revs_diff to announce the revision, then _bulk_docs with
+    new_edits=false and an explicit _rev/_revisions."""
     now_ms = int(time.time() * 1000)
     content_obj = {
         "_id": doc_id,
@@ -639,30 +885,40 @@ def neocloud_write_doc(cloud, session_id, doc_id, rev_str, revisions, uid,
         "_rev": rev_str,
         "_revisions": revisions,
     }
-    rev_hash = rev_str.split("-", 1)[1]
     neocloud_request(cloud, session_id, "POST", "_revs_diff",
                       json_body={doc_id: [rev_str]}, debug=debug)
     neocloud_request(cloud, session_id, "POST", "_bulk_docs",
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
 
 
-def do_send(cloud, token, filename, debug=False):
+def do_send(cloud, token, filename, skip_optional=False, debug=False):
     uid = get_uid(cloud, token, debug=debug)
-    api_call(cloud, token, "users/getDevice", debug=debug)
-    api_call(cloud, token, "im/getSig", params={"user": uid}, debug=debug)
 
-    buckets = api_call(cloud, token, "config/buckets", debug=debug)
-    onyx_cloud = _get(buckets, "data", "onyx-cloud")
+    # getDevice and im/getSig: both responses are discarded -- they exist
+    # because the upstream project mirrored the web client's call sequence.
+    # They may well be pure ceremony, but saveAndPush also looked redundant
+    # right up until dropping it delivered 0 of 14 files, so they stay on
+    # by default and are only skipped if explicitly configured.
+    if not skip_optional:
+        api_call(cloud, token, "users/getDevice", debug=debug)
+        api_call(cloud, token, "im/getSig", params={"user": uid}, debug=debug)
+
+    onyx_cloud = get_buckets(cloud, token, debug=debug)
     bucket_name = onyx_cloud["bucket"]
     endpoint = onyx_cloud["aliEndpoint"]
 
-    stss = api_call(cloud, token, "config/stss", debug=debug)
-    stss_data = _get(stss, "data")
+    stss_data = get_stss(cloud, token, debug=debug)
     access_key_id = stss_data["AccessKeyId"]
     access_key_secret = stss_data["AccessKeySecret"]
     security_token = stss_data["SecurityToken"]
 
     auth = oss2.StsAuth(access_key_id, access_key_secret, security_token)
+    # config/buckets returns a bare hostname, and oss2 defaults a
+    # scheme-less endpoint to http:// -- which uploaded the file, and
+    # signed the download URL, in cleartext on port 80. The web client
+    # uses https for both; force the same here.
+    if "://" not in endpoint:
+        endpoint = "https://" + endpoint
     bucket = oss2.Bucket(auth, endpoint, bucket_name)
 
     _, extension = os.path.splitext(filename)
@@ -695,16 +951,19 @@ def do_send(cloud, token, filename, debug=False):
             f"registered or delivered, safe to just retry 'send'"
         ) from e
 
-    # saveAndPush -- restored. A full switch away from it (this write plus
-    # a repush-style bump instead, no saveAndPush at all) was tried and
-    # confirmed to NOT deliver to the device (a 14-file batch registered
-    # cleanly with no duplicates, but 0 showed up on-device, and a manual
-    # device sync didn't fix it). So saveAndPush is doing something
-    # load-bearing for delivery beyond what our own write achieves --
-    # likely whatever notification/trigger the real repush button relies
-    # on only works to RE-trigger delivery of something already fully
-    # registered once, not as a substitute for that first registration.
-    api_call(
+    final_rev = f"1-{rev1_hash}"
+
+    # saveAndPush, with 'cbMsg' naming the document we just wrote.
+    #
+    # This is the single call that makes my-boox behave like the web UI.
+    # The browser posts cbMsg: {id, rev} pointing at its own _bulk_docs
+    # write, and the server ADOPTS that document -- its response echoes
+    # the same id back. Omitting cbMsg (which is what earlier versions
+    # did) makes the server register a second, independent /neocloud/
+    # document for the same file instead: hence two rows per file where
+    # the browser shows one, and hence a delete that only removed one of
+    # them. Same call, one extra field, one document per file.
+    result = api_call(
         cloud, token, "push/saveAndPush",
         data={
             "data": {
@@ -715,14 +974,21 @@ def do_send(cloud, token, filename, debug=False):
                 "resourceKey": remotename,
                 "resourceType": resource_type,
                 "title": basename,
-            }
+            },
+            "cbMsg": {"id": doc_id, "rev": final_rev},
         },
         debug=debug,
     )
 
-    final_rev = f"1-{rev1_hash}"
+    # Normally the echo is our own id (adoption worked). Anything else
+    # means the server made its own document after all, so report it and
+    # let the caller track it too.
+    cb_msg = (result.get("data") or {}).get("cbMsg") or {}
+    cb_id, cb_rev = cb_msg.get("id"), cb_msg.get("rev")
+    if cb_id == doc_id:
+        cb_id, cb_rev = None, None
 
-    return doc_id, final_rev, basename, size
+    return doc_id, final_rev, basename, size, cb_id, cb_rev
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +1016,18 @@ def with_reauth(action, config, config_path, debug=False):
                 205,
             )
         cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+
+        # Checked BEFORE requesting a code: the re-auth flow blocks on
+        # input(), so under cron or any other non-tty caller it would
+        # otherwise burn a real verification code and then die on EOFError
+        # with a traceback instead of a diagnosis.
+        if not sys.stdin.isatty():
+            die(
+                "my-boox: token rejected and stdin is not a terminal -- re-auth "
+                "needs to prompt for the emailed code. Run 'my-boox ls' by hand "
+                "once to refresh the token, then re-run this.",
+                205,
+            )
 
         sys.stderr.write("my-boox: auth failed, requesting a fresh verification code...\n")
         try:
@@ -783,9 +1061,11 @@ def with_reauth(action, config, config_path, debug=False):
 def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     cache_path = resolve_cache_path(config, config_path)
-    failures = []
+    missing = []   # never existed locally -- exit 202
+    failed = []    # tried and failed -- exit 204
 
     check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
+    skip_optional = _config_bool(config, "send_skip_optional_calls", False)
 
     existing = set()
     if check_duplicates:
@@ -800,29 +1080,53 @@ def cmd_send(config, config_path, filenames, debug=False):
         for meta in docs.values():
             name, size = meta.get("name"), meta.get("size")
             if name is not None and size is not None:
-                existing.add((name, size))
+                # _as_int for the same reason group_docs needs it: a
+                # server-side "42" must match a local getsize() 42, or the
+                # duplicate check silently never fires.
+                existing.add((str(name), _as_int(size)))
 
     for raw_filename in filenames:
         filename = os.path.abspath(os.path.expanduser(raw_filename))
         if not os.path.isfile(filename):
             sys.stderr.write(f"my-boox: file not found: {filename}\n")
-            failures.append(raw_filename)
+            missing.append(raw_filename)
             continue
 
         basename = os.path.basename(filename)
-        size = os.path.getsize(filename)
+        try:
+            size = os.path.getsize(filename)
+        except OSError as e:
+            sys.stderr.write(f"my-boox: cannot read {basename}: {e}\n")
+            failed.append(raw_filename)
+            continue
         if check_duplicates and (basename, size) in existing:
             print(f"skipped: {basename} (already present, same name and size)")
             continue
 
         def action(token, filename=filename):
-            return do_send(cloud, token, filename, debug=debug)
+            return do_send(cloud, token, filename,
+                           skip_optional=skip_optional, debug=debug)
 
         try:
             result = with_reauth(action, config, config_path, debug=debug)
         except (BooxAPIError, BooxAuthError) as e:
             sys.stderr.write(f"my-boox: failed to send {basename}: {e}\n")
-            failures.append(raw_filename)
+            failed.append(raw_filename)
+            continue
+        except Exception as e:
+            # oss2 raises its own exception hierarchy for a failed upload
+            # (and OSError surfaces for a file that vanishes mid-read).
+            # Neither is a BooxError, so an unhandled one used to abort the
+            # whole batch at the first bad file -- exactly the opposite of
+            # the documented "the rest of the batch is still attempted".
+            # SystemExit is a BaseException, so a genuine re-auth failure
+            # still stops the run rather than being swallowed here.
+            if debug:
+                raise
+            sys.stderr.write(
+                f"my-boox: failed to send {basename}: {type(e).__name__}: {e}\n"
+            )
+            failed.append(raw_filename)
             continue
 
         print(f"sent: {basename}")
@@ -830,20 +1134,100 @@ def cmd_send(config, config_path, filenames, debug=False):
             existing.add((basename, size))
 
         if result:
-            doc_id, rev, name, doc_size = result
+            doc_id, rev, name, doc_size, cb_id, cb_rev = result
+            # Stamped with the real send time rather than None: 'ls' sorts
+            # newest-first on this, and a None sorted a just-sent file to
+            # the bottom of the list until the next full refresh.
+            now_ms = int(time.time() * 1000)
             cache = load_cache(cache_path)
             cache["docs"][doc_id] = {
                 "name": name, "size": doc_size, "rev": rev,
-                "createdAt": None, "updatedAt": None,
+                "createdAt": now_ms, "updatedAt": now_ms,
             }
+            # Only set when the server declined to adopt our document and
+            # made its own anyway; grouped with the above by (name, size)
+            # so 'ls' still shows one row and 'del' removes both.
+            if cb_id and cb_rev:
+                cache["docs"][cb_id] = {
+                    "name": name, "size": doc_size, "rev": cb_rev,
+                    "createdAt": now_ms, "updatedAt": now_ms,
+                }
             save_cache(cache_path, cache)
 
-    if failures:
+    problems = missing + failed
+    if problems:
         die(
-            f"my-boox: {len(failures)} of {len(filenames)} failed: " +
-            ", ".join(failures),
-            204,
+            f"my-boox: {len(problems)} of {len(filenames)} failed: " +
+            ", ".join(problems),
+            204 if failed else 202,
         )
+
+
+def _as_int(value, default=0):
+    """Coerce a /neocloud/ numeric field to a real int.
+
+    Sizes and createdAt/updatedAt timestamps come back as a JSON number
+    for some documents and as a decimal STRING for others, in the same
+    _changes batch. Both fields are used for ordering, grouping and
+    ':n' formatting, all of which raise TypeError/ValueError the moment a
+    str sneaks in. Anything unparseable becomes `default`."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return default
+    return default
+
+
+def group_docs(docs):
+    """Collapse the several /neocloud/ documents that make up ONE logical
+    file into a single entry.
+
+    Current sends produce exactly one document per file (saveAndPush is
+    given a 'cbMsg' naming our own write, so the server adopts it instead
+    of registering its own). Grouping still matters for what is already
+    in the account: every file sent before that fix has a leftover second
+    document, and both must be deleted for the file to really go away.
+
+    Grouping key is (name, size), the same pair 'send' already uses for
+    its duplicate check. Two genuinely distinct files with identical name
+    AND size would be merged into one entry -- rare, and deleting one of
+    those would almost certainly mean wanting both gone anyway.
+
+    Returns [{"id":, "ids": [...], "name":, "size":, "sort_key":}, ...]
+    where 'id' is the one to display and 'ids' is every underlying
+    document that must be deleted to really remove the file."""
+    groups = {}
+    for doc_id, meta in docs.items():
+        name, size = meta.get("name"), meta.get("size")
+        if name is None or size is None:
+            continue
+        name = str(name)
+        # Normalized before it is used as part of the grouping key, so a
+        # server-side "42" and a local os.path.getsize() 42 land in the
+        # same group rather than showing up as two rows for one file.
+        size = _as_int(size)
+        key = (name, size)
+        stamp = _as_int(meta.get("updatedAt")) or _as_int(meta.get("createdAt"))
+        g = groups.setdefault(key, {"ids": [], "name": name, "size": size,
+                                     "sort_key": 0})
+        g["ids"].append(doc_id)
+        if stamp > g["sort_key"]:
+            g["sort_key"] = stamp
+
+    out = []
+    for g in groups.values():
+        g["ids"].sort()
+        g["id"] = g["ids"][0]
+        out.append(g)
+    out.sort(key=lambda g: g["sort_key"], reverse=True)
+    return out
 
 
 def cmd_ls(config, config_path, debug=False):
@@ -854,41 +1238,46 @@ def cmd_ls(config, config_path, debug=False):
         return refresh_cache(cloud, token, cache_path, debug=debug)
 
     docs = with_reauth(action, config, config_path, debug=debug) or {}
-
-    rows = []
-    for doc_id, meta in docs.items():
-        name, size = meta.get("name"), meta.get("size")
-        if name is None or size is None:
-            continue
-        sort_key = meta.get("updatedAt") or meta.get("createdAt") or 0
-        rows.append((doc_id, size, name, sort_key))
-    rows.sort(key=lambda r: r[3], reverse=True)
+    groups = group_docs(docs)
 
     # I would expect LC_ALL to be set but it may not be (kept from upstream,
     # affects the ':>Nn' locale-aware digit grouping below)
-    locale.setlocale(locale.LC_ALL, locale.getlocale()[0])
+    try:
+        current_locale = locale.getlocale()[0] or "C"
+        locale.setlocale(locale.LC_ALL, current_locale)
+    except locale.Error:
+        pass
 
-    id_width = max([len(r[0]) for r in rows] + [len("ID")])
+    id_width = max([len(g["id"]) for g in groups] + [len("ID")])
     size_width = 10
-    name_width = max([len(r[2]) for r in rows] + [len("Name")])
+    name_width = max([len(g["name"]) for g in groups] + [len("Name")])
 
     print(f"{'ID':<{id_width}} | {'Size':>{size_width}} | Name")
     print("-" * id_width + "-|-" + "-" * size_width + "-|-" + "-" * name_width)
-    for doc_id, size, name, _ in rows:
-        print(f"{doc_id:<{id_width}} | {size:>{size_width}n} | {name}")
+    for g in groups:
+        print(f"{g['id']:<{id_width}} | {g['size']:>{size_width}n} | {g['name']}")
 
-    return rows
+    return groups
 
 
 def do_delete_one(cloud, token, doc_id, debug=False):
-    """Delete a single neocloud document directly by its real id -- ids
-    come straight from 'ls', which reads /neocloud/ natively now, so
-    there's no id-mismatch class of problem to work around any more."""
+    """Delete a single file the same way the web UI does: write the
+    /neocloud/ tombstone, then tell the api/1 side about it.
+
+    The browser does BOTH, in that order -- _revs_diff + _bulk_docs to
+    tombstone the sync-gateway document, then
+    api/1/push/message/batchDelete with the same id. Earlier versions of
+    this tool only did the first half, which is why a deleted file could
+    come back or linger: the tombstone removes it from /neocloud/, but
+    the push-message record it is paired with survives untouched."""
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
     doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
     if not doc:
         return False
+
     neocloud_delete_doc(cloud, session_id, doc_id, doc["_rev"], debug=debug)
+    api_call(cloud, token, "push/message/batchDelete",
+             data={"ids": [doc_id]}, debug=debug)
     return True
 
 
@@ -896,11 +1285,34 @@ def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     cache_path = resolve_cache_path(config, config_path)
 
+    # Each logical file is backed by more than one /neocloud/ document (our
+    # own write plus saveAndPush's cbMsg -- see group_docs). Deleting only
+    # the id shown by 'ls' would leave the sibling behind, so expand every
+    # requested id into its whole group first. Ids not present in the cache
+    # (never seen by 'ls', or already deleted) fall through unexpanded and
+    # are attempted as-is.
+    cached_docs = load_cache(cache_path)["docs"]
+    id_to_group = {}
+    for g in group_docs(cached_docs):
+        for member in g["ids"]:
+            id_to_group[member] = g["ids"]
+
+    targets = []
+    for requested in ids:
+        for member in id_to_group.get(requested, [requested]):
+            if member not in targets:
+                targets.append(member)
+
+    extra = len(targets) - len(ids)
+    if extra > 0:
+        print(f"note: expanded {len(ids)} id(s) to {len(targets)} underlying "
+              f"document(s) -- each file is backed by more than one")
+
     succeeded = []
     untracked = []
     failures = []
 
-    for doc_id in ids:
+    for doc_id in targets:
         def action(token, doc_id=doc_id):
             return do_delete_one(cloud, token, doc_id, debug=debug)
 
@@ -919,7 +1331,7 @@ def cmd_del(config, config_path, ids, debug=False):
             print(f"deleted: {doc_id}")
             succeeded.append(doc_id)
         else:
-            print(f"deleted: {doc_id} (not found -- already gone, or never existed)")
+            print(f"not found: {doc_id} (already gone, or never existed)")
             untracked.append(doc_id)
 
     if untracked:
@@ -932,10 +1344,839 @@ def cmd_del(config, config_path, ids, debug=False):
 
     if failures:
         die(
-            f"my-boox: {len(failures)} of {len(ids)} failed to delete: " +
+            f"my-boox: {len(failures)} of {len(targets)} failed to delete: " +
             ", ".join(failures),
             204,
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-contained tests
+# ---------------------------------------------------------------------------
+
+class TestConfigHandling(unittest.TestCase):
+    def test_load_config_uses_defaults_and_saves(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            self.assertEqual(config["default"]["cloud"], DEFAULT_CLOUD)
+            self.assertEqual(config["default"]["duplicate_check_on_send"], "true")
+            self.assertEqual(config["default"]["send_skip_optional_calls"], "false")
+
+            save_config(config_path, config)
+            self.assertTrue(os.path.isfile(config_path))
+
+            reloaded = load_config(config_path)
+            self.assertEqual(reloaded["default"]["cloud"], DEFAULT_CLOUD)
+
+
+class TestCacheAndGrouping(unittest.TestCase):
+    def test_cache_round_trip_and_path_resolution(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+            self.assertTrue(cache_path.endswith("my-boox.ini.neocloud-cache.json"))
+
+            cache = {"last_seq": "0", "docs": {"abc": {"name": "report.pdf", "size": 42, "rev": "1-abc"}}}
+            save_cache(cache_path, cache)
+            reloaded = load_cache(cache_path)
+            self.assertEqual(reloaded["docs"]["abc"]["name"], "report.pdf")
+
+    def test_group_docs_merges_same_logical_file(self):
+        docs = {
+            "first": {"name": "report.pdf", "size": 42, "rev": "1-first", "updatedAt": 100},
+            "second": {"name": "report.pdf", "size": 42, "rev": "1-second", "updatedAt": 200},
+            "third": {"name": "other.pdf", "size": 99, "rev": "1-third", "updatedAt": 50},
+        }
+        groups = group_docs(docs)
+        self.assertEqual(len(groups), 2)
+        report = next(group for group in groups if group["name"] == "report.pdf")
+        self.assertEqual(sorted(report["ids"]), ["first", "second"])
+        self.assertEqual(report["size"], 42)
+
+
+class TestCliBehavior(unittest.TestCase):
+    def test_help_and_create_config_output(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = main(["--create-config"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[default]", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_config_path_output_is_stable(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = main(["--config"])
+        self.assertEqual(rc, 0)
+        self.assertIn("my-boox.conf", stdout.getvalue())
+
+
+class TestCommandHandlers(unittest.TestCase):
+    def test_with_reauth_retries_after_auth_failure(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["email"] = "user@example.com"
+            config["default"]["token"] = "stale"
+            save_config(config_path, config)
+
+            attempts = {"count": 0}
+
+            def flaky_action(token):
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise BooxAuthError("token rejected")
+                return token
+
+            # isatty: the interactive path is the one under test here; the
+            # non-tty refusal has its own test in TestRegressions.
+            with mock.patch.object(module, "do_request_code"), \
+                 mock.patch.object(module, "do_obtain_token", return_value="fresh-token"), \
+                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                 mock.patch("builtins.input", return_value="123456"):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = with_reauth(flaky_action, config, config_path, debug=False)
+
+            self.assertEqual(result, "fresh-token")
+            reloaded = load_config(config_path)
+            self.assertEqual(reloaded["default"]["token"], "fresh-token")
+
+    def test_send_updates_cache_for_new_upload(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+
+            sample = os.path.join(tmpdir, "sample.txt")
+            with open(sample, "w") as handle:
+                handle.write("hello world")
+
+            with mock.patch.object(module, "refresh_cache", return_value={}), \
+                 mock.patch.object(module, "with_reauth", side_effect=lambda action, *args, **kwargs: action("token")), \
+                 mock.patch.object(module, "do_send", return_value=("doc-1", "1-abc", "sample.txt", 11, "cb-1", "1-cb")) as send_mock:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cmd_send(config, config_path, [sample], debug=False)
+
+            self.assertTrue(os.path.isfile(cache_path))
+            cache = load_cache(cache_path)
+            self.assertIn("doc-1", cache["docs"])
+            self.assertIn("cb-1", cache["docs"])
+            self.assertEqual(cache["docs"]["doc-1"]["name"], "sample.txt")
+            self.assertIn("sent: sample.txt", stdout.getvalue())
+            send_mock.assert_called_once()
+
+    def test_ls_groups_duplicate_documents_and_formats_output(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+            cache = {
+                "last_seq": "0",
+                "docs": {
+                    "doc-a": {"name": "report.pdf", "size": 42, "rev": "1-a", "updatedAt": 200},
+                    "doc-b": {"name": "report.pdf", "size": 42, "rev": "1-b", "updatedAt": 100},
+                    "doc-c": {"name": "other.pdf", "size": 99, "rev": "1-c", "updatedAt": 50},
+                },
+            }
+            save_cache(cache_path, cache)
+
+            with mock.patch.object(module, "with_reauth", side_effect=lambda action, *args, **kwargs: action("token")), \
+                 mock.patch.object(module, "refresh_cache", return_value=cache["docs"]):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    groups = cmd_ls(config, config_path, debug=False)
+
+            self.assertEqual(len(groups), 2)
+            self.assertEqual(groups[0]["name"], "report.pdf")
+            self.assertIn("report.pdf", stdout.getvalue())
+            self.assertIn("doc-a", stdout.getvalue())
+
+    def test_del_expands_grouped_ids_and_removes_cache_entries(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+            cache = {
+                "last_seq": "0",
+                "docs": {
+                    "doc-a": {"name": "report.pdf", "size": 42, "rev": "1-a", "updatedAt": 200},
+                    "doc-b": {"name": "report.pdf", "size": 42, "rev": "1-b", "updatedAt": 100},
+                },
+            }
+            save_cache(cache_path, cache)
+
+            deleted = []
+
+            def fake_delete(cloud, token, doc_id, debug=False):
+                deleted.append(doc_id)
+                return True
+
+            with mock.patch.object(module, "with_reauth", side_effect=lambda action, *args, **kwargs: action("token")), \
+                 mock.patch.object(module, "do_delete_one", side_effect=fake_delete):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cmd_del(config, config_path, ["doc-a"], debug=False)
+
+            self.assertEqual(sorted(deleted), ["doc-a", "doc-b"])
+            reloaded = load_cache(cache_path)
+            self.assertNotIn("doc-a", reloaded["docs"])
+            self.assertNotIn("doc-b", reloaded["docs"])
+            self.assertIn("deleted: doc-b", stdout.getvalue())
+
+
+class _FakeResponse:
+    """Minimal stand-in for requests.Response -- only the three attributes
+    _paced_request/api_call/neocloud_request actually touch."""
+
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text else json.dumps(payload)
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _FakeRequests:
+    """Stands in for the `requests` module. Each call pops the next queued
+    response (or raises the next queued exception) and records the call."""
+
+    class RequestException(Exception):
+        pass
+
+    def __init__(self, queue):
+        self._queue = list(queue)
+        self.calls = []
+
+    def request(self, method, url, headers=None, params=None, data=None,
+                timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers,
+                           "params": params, "data": data})
+        nxt = self._queue.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+@contextlib.contextmanager
+def _no_pacing(module, requests_stub=None, attempts=None):
+    """Run a block with the sleep-based pacing disabled (tests must not
+    spend real seconds) and, optionally, a stubbed `requests` module."""
+    patches = [
+        mock.patch.object(module, "API_PACING", 0),
+        mock.patch.object(module, "API_RETRY_DELAY", 0),
+        mock.patch.object(module, "_LAST_REQUEST_TIME", 0.0),
+        mock.patch.object(module, "time", mock.Mock(monotonic=time.monotonic,
+                                                    sleep=lambda _s: None,
+                                                    time=time.time)),
+    ]
+    if requests_stub is not None:
+        patches.append(mock.patch.object(module, "requests", requests_stub))
+    if attempts is not None:
+        patches.append(mock.patch.object(module, "API_RETRY_ATTEMPTS", attempts))
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
+class TestRegressions(unittest.TestCase):
+    """One test per failure actually observed in a real run (or reproduced
+    from one). Each names the symptom it locks down."""
+
+    # -- 'ls' against a live account crashed with
+    #    "TypeError: '>' not supported between instances of 'str' and 'int'"
+    #    because /neocloud/ returned updatedAt as a string for some docs.
+    def test_ls_survives_string_timestamps_and_sizes(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            docs = {
+                "aaa": {"name": "old.pdf", "size": "1024", "rev": "1-a",
+                        "createdAt": "1700000000000", "updatedAt": "1700000000000"},
+                "bbb": {"name": "new.pdf", "size": 2048, "rev": "1-b",
+                        "createdAt": 1800000000000, "updatedAt": 1800000000000},
+                "ccc": {"name": "undated.pdf", "size": 7, "rev": "1-c",
+                        "createdAt": None, "updatedAt": None},
+                "ddd": {"name": "garbled.pdf", "size": "not-a-number",
+                        "rev": "1-d", "updatedAt": "also-not-a-number"},
+            }
+            with mock.patch.object(module, "with_reauth",
+                                   side_effect=lambda action, *a, **k: action("token")), \
+                 mock.patch.object(module, "refresh_cache", return_value=docs):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    groups = cmd_ls(config, config_path, debug=False)
+
+            self.assertEqual([g["name"] for g in groups[:2]],
+                             ["new.pdf", "old.pdf"])  # newest first, no crash
+            self.assertIn("1,024", stdout.getvalue().replace(" ", ","))
+
+    # -- a server-side "42" and a local getsize() 42 must be one file, not
+    #    two rows and a duplicate upload.
+    def test_group_docs_treats_string_and_int_size_as_one_file(self):
+        groups = group_docs({
+            "ours": {"name": "report.pdf", "size": 42, "updatedAt": 2},
+            "theirs": {"name": "report.pdf", "size": "42", "updatedAt": 1},
+        })
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(sorted(groups[0]["ids"]), ["ours", "theirs"])
+        self.assertEqual(groups[0]["size"], 42)
+
+    # -- `my-boox --config PATH ls` skipped the venv bootstrap and then died
+    #    with "'NoneType' object has no attribute 'RequestException'".
+    def test_venv_bootstrap_runs_whenever_a_command_is_present(self):
+        needs_venv = [
+            ["ls"],
+            ["--config", "/tmp/x.ini", "ls"],
+            ["--config=/tmp/x.ini", "ls"],
+            ["-D", "--config", "/tmp/x.ini", "send", "a.pdf"],
+            ["del", "abc123"],
+        ]
+        for argv in needs_venv:
+            with self.subTest(argv=argv):
+                self.assertFalse(_should_skip_venv_bootstrap(argv))
+
+        skips_venv = [
+            ["--config"], ["--help"], ["-h"], ["--version"], ["-V"],
+            ["--create-config"], ["--create-config", "/tmp/x.ini"],
+            ["--create-config=/tmp/x.ini"], ["--run-tests"], ["--run-tests=core"],
+        ]
+        for argv in skips_venv:
+            with self.subTest(argv=argv):
+                self.assertTrue(_should_skip_venv_bootstrap(argv))
+
+    # -- missing deps reported as themselves, with exit 203, instead of an
+    #    AttributeError on None deep inside the first request.
+    def test_missing_dependency_reports_exit_203(self):
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "requests", None), \
+             mock.patch.object(module, "oss2", None):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    _require_deps()
+        self.assertEqual(ctx.exception.code, 203)
+        self.assertIn("requests", stderr.getvalue())
+        self.assertIn("oss2", stderr.getvalue())
+
+    # -- '--config=PATH' fell through to the command slot and was rejected
+    #    as "unknown command: --config=/path".
+    def test_equals_forms_of_config_flags_are_parsed(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = main(["--config=/tmp/does-not-exist.ini"])
+        self.assertEqual(rc, 0)
+        self.assertIn("/tmp/does-not-exist.ini", stdout.getvalue())
+
+        # ...and with a command it reaches dispatch (206 = named config
+        # missing), rather than dying as an unknown command (201).
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["--config=/tmp/does-not-exist.ini", "ls"])
+        self.assertEqual(ctx.exception.code, 206)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "written.ini")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = main([f"--create-config={target}"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(target))
+
+    # -- '--create-config FILE' silently overwrote an existing config,
+    #    destroying the stored token.
+    def test_create_config_refuses_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing = os.path.join(tmpdir, "my-boox.ini")
+            with open(existing, "w") as handle:
+                handle.write("[default]\ntoken = precious\n")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = main(["--create-config", existing])
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("refusing to overwrite", stderr.getvalue())
+            with open(existing) as handle:
+                self.assertIn("precious", handle.read())
+
+    # -- the config holds a full account credential; it was written 0644.
+    def test_config_and_cache_are_written_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["token"] = "secret-token"
+            save_config(config_path, config)
+            self.assertEqual(os.stat(config_path).st_mode & 0o777, 0o600)
+
+            cache_path = resolve_cache_path(config, config_path)
+            save_cache(cache_path, {"last_seq": "1", "docs": {}})
+            self.assertEqual(os.stat(cache_path).st_mode & 0o777, 0o600)
+
+    def test_cache_write_leaves_no_partial_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            save_cache(cache_path, {"last_seq": "1", "docs": {"a": {"name": "x", "size": 1}}})
+
+            with mock.patch("os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    save_cache(cache_path, {"last_seq": "2", "docs": {}})
+
+            # Old content intact, and no stray temp files left behind.
+            self.assertEqual(load_cache(cache_path)["last_seq"], "1")
+            self.assertEqual([n for n in os.listdir(tmpdir) if n.endswith(".tmp")], [])
+
+    def test_corrupt_cache_falls_back_to_empty_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with open(cache_path, "w") as handle:
+                handle.write('{"last_seq": "5", "docs": {trunca')
+            self.assertEqual(load_cache(cache_path), {"last_seq": "0", "docs": {}})
+
+    # -- api_retry_attempts = 0 skipped the loop and raised
+    #    "TypeError: exceptions must derive from BaseException".
+    def test_zero_retry_attempts_still_makes_one_attempt(self):
+        module = sys.modules[__name__]
+        stub = _FakeRequests([_FakeResponse(200, {"result_code": 0})])
+        with _no_pacing(module, stub, attempts=0):
+            resp = _paced_request("GET", "https://example.invalid/x")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(stub.calls), 1)
+
+    def test_transient_5xx_is_retried_then_succeeds(self):
+        module = sys.modules[__name__]
+        stub = _FakeRequests([
+            _FakeResponse(504, {}),
+            _FakeRequests.RequestException("connection reset"),
+            _FakeResponse(200, {"result_code": 0, "data": {"ok": True}}),
+        ])
+        with _no_pacing(module, stub, attempts=3):
+            resp = _paced_request("GET", "https://example.invalid/x")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(stub.calls), 3)
+
+    def test_exhausted_retries_raise_booxapierror_not_typeerror(self):
+        module = sys.modules[__name__]
+        stub = _FakeRequests([_FakeResponse(503, {})] * 2)
+        with _no_pacing(module, stub, attempts=2):
+            with self.assertRaises(BooxAPIError):
+                _paced_request("GET", "https://example.invalid/x")
+
+    def test_404_is_not_treated_as_an_auth_failure(self):
+        # A 404 used to raise BooxAuthError, which made the tool email a
+        # verification code and block on a prompt for something no new
+        # token could ever fix.
+        module = sys.modules[__name__]
+        stub = _FakeRequests([_FakeResponse(404, {"message": "not found"})])
+        with _no_pacing(module, stub, attempts=1):
+            with self.assertRaises(BooxAPIError):
+                api_call("example.invalid", "tok", "push/whatever")
+
+    def test_401_and_nonzero_result_code_still_trigger_reauth(self):
+        module = sys.modules[__name__]
+        stub = _FakeRequests([_FakeResponse(401, {"message": "token expired"})])
+        with _no_pacing(module, stub, attempts=1):
+            with self.assertRaises(BooxAuthError):
+                api_call("example.invalid", "tok", "users/me")
+
+        stub = _FakeRequests([_FakeResponse(200, {"result_code": 1005,
+                                                  "message": "invalid token"})])
+        with _no_pacing(module, stub, attempts=1):
+            with self.assertRaises(BooxAuthError):
+                api_call("example.invalid", "tok", "users/me")
+
+    # -- `my-boox -D ls 2>debug.log` wrote a live session_id to disk in
+    #    cleartext; a -D re-auth wrote the account token itself.
+    def test_debug_output_redacts_credentials(self):
+        module = sys.modules[__name__]
+        payload = {
+            "result_code": 0,
+            "data": {"session_id": "6f798b02cede2dda45a6f3fe343be49a65f0e320",
+                     "token": "live-account-token",
+                     "AccessKeySecret": "sts-secret"},
+        }
+        stub = _FakeRequests([_FakeResponse(200, payload)])
+        stderr = io.StringIO()
+        with _no_pacing(module, stub, attempts=1), \
+             contextlib.redirect_stderr(stderr):
+            api_call("example.invalid", "tok", "users/syncToken",
+                     data={"code": "123456"}, debug=True)
+
+        out = stderr.getvalue()
+        for secret in ("6f798b02cede2dda45a6f3fe343be49a65f0e320",
+                       "live-account-token", "sts-secret", "123456"):
+            self.assertNotIn(secret, out)
+        self.assertIn("redacted", out)
+        self.assertIn("users/syncToken", out)  # still useful for debugging
+
+    def test_redaction_keeps_signed_url_path_but_drops_signature(self):
+        redacted = _redact({"url": "https://oss.example/u/push/f.pdf"
+                                   "?Expires=1&OSSAccessKeyId=k&Signature=abc123"})
+        self.assertIn("f.pdf", redacted["url"])
+        self.assertNotIn("abc123", redacted["url"])
+
+    # -- an oss2 upload error is not a BooxError, so it used to escape
+    #    cmd_send and abort the whole batch at the first bad file.
+    def test_send_continues_batch_after_a_non_boox_upload_error(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+
+            paths = []
+            for name in ("bad.pdf", "good.pdf"):
+                p = os.path.join(tmpdir, name)
+                with open(p, "w") as handle:
+                    handle.write(name)
+                paths.append(p)
+
+            class _OssError(Exception):
+                pass
+
+            def flaky_send(cloud, token, filename, **kwargs):
+                if filename.endswith("bad.pdf"):
+                    raise _OssError("RequestError: connection aborted")
+                return ("doc-good", "1-g", "good.pdf", 8, "cb-good", "1-cbg")
+
+            with mock.patch.object(module, "with_reauth",
+                                   side_effect=lambda action, *a, **k: action("token")), \
+                 mock.patch.object(module, "do_send", side_effect=flaky_send):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                     contextlib.redirect_stderr(stderr), \
+                     self.assertRaises(SystemExit) as ctx:
+                    cmd_send(config, config_path, paths, debug=False)
+
+            # The good file still went, and the exit code reports the bad one.
+            self.assertIn("sent: good.pdf", stdout.getvalue())
+            self.assertIn("failed to send bad.pdf", stderr.getvalue())
+            self.assertEqual(ctx.exception.code, 204)
+            self.assertIn("doc-good", load_cache(resolve_cache_path(config, config_path))["docs"])
+
+    def test_send_with_only_missing_files_exits_202(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), \
+                 self.assertRaises(SystemExit) as ctx:
+                cmd_send(config, config_path,
+                         [os.path.join(tmpdir, "nope.pdf")], debug=False)
+        self.assertEqual(ctx.exception.code, 202)
+        self.assertIn("file not found", stderr.getvalue())
+
+    def test_sent_files_are_cached_with_a_timestamp_so_ls_sorts_them_first(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+            cache_path = resolve_cache_path(config, config_path)
+            save_cache(cache_path, {"last_seq": "0", "docs": {
+                "older": {"name": "older.pdf", "size": 1, "rev": "1-o",
+                          "updatedAt": 1}}})
+
+            sample = os.path.join(tmpdir, "fresh.pdf")
+            with open(sample, "w") as handle:
+                handle.write("x")
+
+            with mock.patch.object(module, "with_reauth",
+                                   side_effect=lambda action, *a, **k: action("token")), \
+                 mock.patch.object(module, "do_send",
+                                   return_value=("doc-new", "1-n", "fresh.pdf", 1, None, None)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cmd_send(config, config_path, [sample], debug=False)
+
+            docs = load_cache(cache_path)["docs"]
+            self.assertGreater(docs["doc-new"]["updatedAt"], 1)
+            self.assertEqual(group_docs(docs)[0]["name"], "fresh.pdf")
+
+    # -- under cron, re-auth burned a real verification code and then died
+    #    on EOFError from input().
+    def test_reauth_refuses_when_stdin_is_not_a_terminal(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.ini")
+            config = load_config(config_path)
+            config["default"]["email"] = "user@example.com"
+
+            def always_auth_error(_token):
+                raise BooxAuthError("token rejected")
+
+            request_code = mock.Mock()
+            with mock.patch.object(module, "do_request_code", request_code), \
+                 mock.patch.object(sys.stdin, "isatty", return_value=False):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), \
+                     self.assertRaises(SystemExit) as ctx:
+                    with_reauth(always_auth_error, config, config_path)
+
+        self.assertEqual(ctx.exception.code, 205)
+        self.assertIn("not a terminal", stderr.getvalue())
+        request_code.assert_not_called()  # no code burned
+
+    # -- the search used to join a single 'my-boox.ini' onto each search
+    #    directory, so in home it looked for '~/my-boox.ini' with no dot.
+    #    The convention is '<name>.conf', dot-prefixed in home only, and a
+    #    config sitting at the conventional path was simply not found.
+    def test_config_search_order_matches_the_convention(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(CONFIG_SEARCH_PATHS, [
+            "/LINKS/default/my-boox.conf",
+            os.path.join(home, ".my-boox.conf"),
+            "/etc/my-boox.conf",
+            "/usr/local/etc/my-boox.conf",
+        ])
+        # The dot belongs to the home entry alone.
+        self.assertNotIn(os.path.join(home, "my-boox.conf"), CONFIG_SEARCH_PATHS)
+        self.assertFalse(any(p.endswith(".ini") for p in CONFIG_SEARCH_PATHS))
+
+    def test_env_var_wins_over_the_config_search_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "elsewhere.ini")
+            with open(target, "w") as handle:
+                handle.write("[default]\n")
+            with mock.patch.dict(os.environ, {CONFIG_ENV_VAR: target}):
+                self.assertEqual(resolve_config_path(required=True), target)
+
+            # An env var pointing at nothing is named as such (206), not
+            # quietly turned into an empty config that fails later as
+            # "no email configured" (205).
+            missing = os.path.join(tmpdir, "not-there.conf")
+            with mock.patch.dict(os.environ, {CONFIG_ENV_VAR: missing}), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as ctx:
+                    resolve_config_path(required=True)
+            self.assertEqual(ctx.exception.code, 206)
+            self.assertIn(CONFIG_ENV_VAR, err.getvalue())
+            with mock.patch.dict(os.environ, {CONFIG_ENV_VAR: ""}, clear=False), \
+                 mock.patch.object(sys.modules[__name__], "CONFIG_SEARCH_PATHS",
+                                   [os.path.join(tmpdir, "my-boox.conf")]):
+                # Nothing there -> the documented 206.
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        resolve_config_path(required=True)
+                self.assertEqual(ctx.exception.code, 206)
+
+    # -- the browser posts saveAndPush with cbMsg naming its own
+    #    _bulk_docs write, and the server adopts that document. Without
+    #    cbMsg the server registers a SECOND document for the same file:
+    #    two rows per file where the web UI shows one.
+    def test_send_hands_saveandpush_our_own_document_as_cbmsg(self):
+        module = sys.modules[__name__]
+        calls = []
+
+        def fake_api_call(cloud, token, api_url, **kwargs):
+            calls.append((api_url, kwargs.get("data")))
+            if api_url == "push/saveAndPush":
+                cb = kwargs["data"]["cbMsg"]
+                # The server echoes the adopted id back unchanged.
+                return {"result_code": 0, "data": {"cbMsg": dict(cb)}}
+            return {"result_code": 0, "data": {}}
+
+        written = {}
+
+        def fake_write_doc(cloud, session_id, doc_id, rev_str, revisions, *a, **k):
+            written["doc_id"], written["rev"] = doc_id, rev_str
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample = os.path.join(tmpdir, "report.pdf")
+            with open(sample, "w") as handle:
+                handle.write("x" * 11)
+
+            with mock.patch.object(module, "api_call", side_effect=fake_api_call), \
+                 mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "get_buckets",
+                                   return_value={"bucket": "onyx-cloud",
+                                                 "aliEndpoint": "oss.invalid"}), \
+                 mock.patch.object(module, "get_stss",
+                                   return_value={"AccessKeyId": "k",
+                                                 "AccessKeySecret": "s",
+                                                 "SecurityToken": "t"}), \
+                 mock.patch.object(module, "neocloud_write_doc", side_effect=fake_write_doc), \
+                 mock.patch.object(module, "oss2", mock.MagicMock()):
+                doc_id, rev, name, size, cb_id, cb_rev = do_send(
+                    "example.invalid", "tok", sample, skip_optional=True)
+
+        save = dict(calls)["push/saveAndPush"]
+        self.assertEqual(save["cbMsg"], {"id": doc_id, "rev": rev})
+        self.assertEqual(written["doc_id"], doc_id)   # same doc we wrote
+        self.assertEqual(written["rev"], rev)
+        # Adopted -> no second document to track.
+        self.assertIsNone(cb_id)
+        self.assertIsNone(cb_rev)
+        self.assertEqual((name, size), ("report.pdf", 11))
+
+    def test_send_still_tracks_a_second_document_if_the_server_makes_one(self):
+        module = sys.modules[__name__]
+
+        def fake_api_call(cloud, token, api_url, **kwargs):
+            if api_url == "push/saveAndPush":
+                return {"result_code": 0,
+                        "data": {"cbMsg": {"id": "server-made-its-own",
+                                           "rev": "1-server"}}}
+            return {"result_code": 0, "data": {}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample = os.path.join(tmpdir, "report.pdf")
+            with open(sample, "w") as handle:
+                handle.write("x")
+
+            with mock.patch.object(module, "api_call", side_effect=fake_api_call), \
+                 mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "get_buckets",
+                                   return_value={"bucket": "b", "aliEndpoint": "e"}), \
+                 mock.patch.object(module, "get_stss",
+                                   return_value={"AccessKeyId": "k",
+                                                 "AccessKeySecret": "s",
+                                                 "SecurityToken": "t"}), \
+                 mock.patch.object(module, "neocloud_write_doc"), \
+                 mock.patch.object(module, "oss2", mock.MagicMock()):
+                _, _, _, _, cb_id, cb_rev = do_send(
+                    "example.invalid", "tok", sample, skip_optional=True)
+
+        self.assertEqual((cb_id, cb_rev), ("server-made-its-own", "1-server"))
+
+    # -- the browser tombstones the /neocloud/ document AND posts
+    #    api/1/push/message/batchDelete with the same id. Doing only the
+    #    first half left the paired push-message record behind.
+    def test_delete_tombstones_then_calls_batchdelete(self):
+        module = sys.modules[__name__]
+        order = []
+
+        def fake_get_doc(cloud, session_id, doc_id, debug=False):
+            return {"_id": doc_id, "_rev": "2-abc"}
+
+        def fake_delete_doc(cloud, session_id, doc_id, rev, debug=False):
+            order.append(("tombstone", doc_id, rev))
+
+        def fake_api_call(cloud, token, api_url, **kwargs):
+            order.append(("api", api_url, kwargs.get("data")))
+            return {"result_code": 0, "data": None}
+
+        with mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+             mock.patch.object(module, "neocloud_get_doc", side_effect=fake_get_doc), \
+             mock.patch.object(module, "neocloud_delete_doc", side_effect=fake_delete_doc), \
+             mock.patch.object(module, "api_call", side_effect=fake_api_call):
+            found = do_delete_one("example.invalid", "tok", "doc123")
+
+        self.assertTrue(found)
+        self.assertEqual(order, [
+            ("tombstone", "doc123", "2-abc"),
+            ("api", "push/message/batchDelete", {"ids": ["doc123"]}),
+        ])
+
+    # -- oss2 defaults a scheme-less endpoint to http://, so uploads went
+    #    out on port 80 in cleartext while the browser used https.
+    def test_upload_endpoint_is_forced_to_https(self):
+        module = sys.modules[__name__]
+        oss_stub = mock.MagicMock()
+
+        def fake_api_call(cloud, token, api_url, **kwargs):
+            if api_url == "push/saveAndPush":
+                return {"result_code": 0, "data": {"cbMsg": {}}}
+            return {"result_code": 0, "data": {}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample = os.path.join(tmpdir, "a.txt")
+            with open(sample, "w") as handle:
+                handle.write("x")
+
+            with mock.patch.object(module, "api_call", side_effect=fake_api_call), \
+                 mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "get_buckets",
+                                   return_value={"bucket": "onyx-cloud",
+                                                 "aliEndpoint": "oss-us-west-1.aliyuncs.com"}), \
+                 mock.patch.object(module, "get_stss",
+                                   return_value={"AccessKeyId": "k",
+                                                 "AccessKeySecret": "s",
+                                                 "SecurityToken": "t"}), \
+                 mock.patch.object(module, "neocloud_write_doc"), \
+                 mock.patch.object(module, "oss2", oss_stub):
+                do_send("example.invalid", "tok", sample, skip_optional=True)
+
+        endpoint = oss_stub.Bucket.call_args[0][1]
+        self.assertEqual(endpoint, "https://oss-us-west-1.aliyuncs.com")
+
+    def test_delete_of_a_missing_document_skips_batchdelete(self):
+        module = sys.modules[__name__]
+        api = mock.Mock()
+        with mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+             mock.patch.object(module, "neocloud_get_doc", return_value=None), \
+             mock.patch.object(module, "api_call", api):
+            self.assertFalse(do_delete_one("example.invalid", "tok", "gone"))
+        api.assert_not_called()
+
+    def test_tombstone_body_matches_the_browsers_bulk_docs_shape(self):
+        module = sys.modules[__name__]
+        sent = {}
+
+        def capture(cloud, session_id, method, path, json_body=None, **k):
+            sent["path"], sent["body"] = path, json_body
+            return {}
+
+        with mock.patch.object(module, "neocloud_request", side_effect=capture):
+            neocloud_delete_doc("example.invalid", "sess", "docid",
+                                "1-f068b0c3797e16957832fb5e94a311c5")
+
+        self.assertEqual(sent["path"], "_bulk_docs")
+        self.assertIs(sent["body"]["new_edits"], False)
+        doc = sent["body"]["docs"][0]
+        self.assertTrue(doc["_deleted"])
+        self.assertEqual(doc["_id"], "docid")
+        start, new_hash = doc["_rev"].split("-", 1)
+        self.assertEqual(start, "2")   # parent was rev 1
+        self.assertEqual(doc["_revisions"],
+                         {"start": 2,
+                          "ids": [new_hash, "f068b0c3797e16957832fb5e94a311c5"]})
+
+    def test_delete_rejects_an_unparseable_revision(self):
+        with self.assertRaises(BooxAPIError):
+            neocloud_delete_doc("example.invalid", "sess", "docid", "no-dash-here")
+
+
+def run_self_tests(selected_group=None):
+    groups = {
+        "smoke": [TestCliBehavior],
+        "core": [TestConfigHandling, TestCacheAndGrouping],
+        "commands": [TestCommandHandlers],
+        "regressions": [TestRegressions],
+        "all": [TestCliBehavior, TestConfigHandling, TestCacheAndGrouping,
+                TestCommandHandlers, TestRegressions],
+    }
+
+    group = (selected_group or "all").strip().lower()
+    if group not in groups:
+        sys.stderr.write(
+            f"my-boox: unknown test group '{selected_group}' (expected one of: {', '.join(sorted(groups))})\n"
+        )
+        return 201
+
+    suite = unittest.TestSuite()
+    for case in groups[group]:
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
+
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
 
 
 # ---------------------------------------------------------------------------
@@ -944,13 +2185,14 @@ def cmd_del(config, config_path, ids, debug=False):
 
 def print_usage(to=sys.stderr):
     to.write(
-        "usage: my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]\n"
-        "       my-boox [-D|--debug] [--config [PATH]] ls|list\n"
-        "       my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]\n"
-        "       my-boox --config [PATH]\n"
-        "       my-boox --create-config [PATH]\n"
-        "       my-boox --help\n"
-        "       my-boox --version\n"
+        "usage: my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]\n"
+        "       my-boox [-D|--debug] [--config PATH] ls|list\n"
+        "       my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]\n"
+        "       my-boox [--config [PATH]]\n"
+        "       my-boox [--create-config [PATH]]\n"
+        "       my-boox [--run-tests [GROUP]]\n"
+        "       my-boox [--help]\n"
+        "       my-boox [--version]\n"
     )
 
 
@@ -963,25 +2205,24 @@ reliance on the legacy push/message listing. Not compatible with ids from
 a v2.x 'ls' -- run the one-time cleanup script first if migrating.
 
 USAGE
-  my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]
-  my-boox [-D|--debug] [--config [PATH]] ls|list
-  my-boox [-D|--debug] [--config [PATH]] del|delete ID [ID...]
-  my-boox --config [PATH]
-  my-boox --create-config [PATH]
-  my-boox --help
-  my-boox --version
+  my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]
+  my-boox [-D|--debug] [--config PATH] ls|list
+  my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]
+  my-boox [--config [PATH]]
+  my-boox [--create-config [PATH]]
+  my-boox [--run-tests [GROUP]]
+  my-boox [--help]
+  my-boox [--version]
 
 COMMANDS
   send FILE [FILE...]
-                    Upload one or more files. Each write is: (1) our own
-                    /neocloud/ document -- confirmed necessary for real
-                    device delivery, (2) api/1/push/saveAndPush --
-                    confirmed ALSO necessary: a version that dropped this
-                    in favor of a repush-style bump on our own document
-                    registered cleanly (no duplicates, no errors) but
-                    delivered 0 of 14 files to the actual device, even
-                    after a genuinely successful manual repush via the
-                    real web UI. So saveAndPush stays.
+                    Upload one or more files, following exactly the call
+                    sequence the BOOXDrop web UI uses: upload to OSS,
+                    write our own /neocloud/ document via _revs_diff +
+                    _bulk_docs, then api/1/push/saveAndPush carrying
+                    'cbMsg' naming that document -- which makes the
+                    server adopt it instead of registering a second one.
+                    That is why one send now produces one row, not two.
                     Skips any file whose name AND size already match
                     something already present (checked once per batch,
                     plus against files sent earlier in the same batch).
@@ -993,11 +2234,19 @@ COMMANDS
                     from /neocloud/ first (cheap after the first run).
                     Use the ID shown with 'del'.
 
-  del ID [ID...]   Delete one or more files by ID (as shown by 'ls').
+  del ID [ID...]   Delete one or more files by ID (as shown by 'ls'),
+                    again mirroring the web UI: tombstone the /neocloud/
+                    document (_revs_diff + _bulk_docs), then
+                    api/1/push/message/batchDelete for the same id. Both
+                    halves are needed -- the tombstone alone leaves the
+                    paired push-message record behind.
                     Each id is deleted independently and confirmed as it
                     happens; if one fails, the rest of the batch still
                     goes ahead, with a summary and nonzero exit code if
                     anything genuinely failed.
+                    Files sent by a pre-4.0 my-boox have a second, stray
+                    document; 'del' expands each id to its whole group so
+                    those go too.
 
 Every request any command makes goes through the same central pacing/retry
 layer: a minimum interval between requests, and automatic retries with
@@ -1013,22 +2262,35 @@ new token, saves that token back to the config file, and retries the
 command once -- no separate login step to run by hand.
 
 OPTIONS
-  -D, --debug        Print the raw JSON of every API call to stderr.
+  -D, --debug        Print the JSON of every API call to stderr, with
+                    credentials (token, session_id, verification code, STS
+                    keys, signed-URL signatures) replaced by a length
+                    marker -- so a redirected debug log is safe to keep
+                    and to paste into a bug report.
   --config [PATH]     With PATH: use that config file for this run only,
-                    instead of the normal search (see CONFIG below).
+                    instead of the normal search (see CONFIG below). The
+                    file must exist; --config on a missing file exits 206
+                    rather than silently falling back to the search.
                     Without PATH, and with no command given: print the
                     config path my-boox would currently resolve to, and
                     exit (does not require the file to actually exist).
+                    '--config=PATH' works too.
   --create-config [PATH]
-                    Write a template config file to PATH. Without PATH,
-                    print the template to stdout instead (so you can review
-                    it, or redirect it wherever you like) -- nothing is
-                    written to disk in that case.
+                    Write a template config file to PATH. Refuses to
+                    overwrite an existing file (your token lives in there).
+                    Without PATH, print the template to stdout instead (so
+                    you can review it, or redirect it wherever you like) --
+                    nothing is written to disk in that case.
+                    '--create-config=PATH' works too.
+  --run-tests [GROUP]
+                    Run the built-in self-tests. GROUP can be one of:
+                    smoke, core, commands, regressions, or all
+                    (default: all).
   -h, --help         Show this help and exit.
   -V, --version      Show version and git commit, then exit.
 
 CONFIG
-  my-boox reads a config file named 'my-boox.ini', in this format:
+  my-boox reads a config file named 'my-boox.conf', in this format:
 
       [default]
       email =
@@ -1054,16 +2316,34 @@ CONFIG
   duplicate_check_on_send   -- true/false. When true (default), 'send'
             skips any file whose name AND size already match something
             already present. Set false to always upload regardless.
+  send_skip_optional_calls -- true/false, default false. 'send' makes two
+            calls (users/getDevice, im/getSig) whose responses are thrown
+            away; they exist only because the upstream project mirrored
+            the web client. Setting this true skips them, saving two
+            requests (and two pacing intervals) per file. UNVERIFIED: a
+            similarly redundant-looking call (saveAndPush) turned out to
+            be required for delivery, so test on-device before trusting
+            this for a real batch.
   cache_path  -- where the local /neocloud/ mirror is kept. Blank (default)
             uses '<this config file's path>.neocloud-cache.json'. Set an
             absolute path to use somewhere else. See LOCAL CACHE below for
             the file's structure.
 
+  The file is written 0600 (owner-only): 'token' is a full credential for
+  the account -- anything that can read it can send to and delete from the
+  device. my-boox re-writes the file at that mode every time it refreshes
+  the token; tighten an existing one by hand with:
+      chmod 600 ~/.my-boox.conf
+
   SEARCH ORDER (first match wins, no merging across locations):
-      1. /LINKS/default/my-boox.ini
-      2. ~/my-boox.ini
-      3. /etc/my-boox.ini
-      4. /usr/local/etc/my-boox.ini
+      0. $MY_BOOX_CONFIG, if set and non-empty (wins outright)
+      1. /LINKS/default/my-boox.conf
+      2. ~/.my-boox.conf        (dot-prefixed, home only)
+      3. /etc/my-boox.conf
+      4. /usr/local/etc/my-boox.conf
+
+  Running a command with no config anywhere in that order exits 206 with
+  the list of paths searched.
 
   Run 'my-boox --config' with no other arguments at any time to see exactly
   which of these paths it currently resolves to.
@@ -1091,7 +2371,7 @@ SELF-MANAGED VIRTUALENV
 
 EXAMPLES
   my-boox --create-config              # see the template
-  my-boox --create-config ~/my-boox.ini  # write it there
+  my-boox --create-config ~/.my-boox.conf # write it there
   my-boox --config                     # where would my-boox look?
   my-boox send report.pdf
   my-boox send a.pdf b.pdf c.pdf        # multiple files in one call
@@ -1101,13 +2381,17 @@ EXAMPLES
   my-boox -D ls                        # with raw API responses on stderr
 
 EXIT CODES
-  201  wrong usage / missing arg / unknown command
-  202  file not found (send)
-  203  venv bootstrap failed
-  204  action failed even after re-auth retry
+  201  wrong usage / missing arg / unknown command / refused to overwrite
+  202  send: every failure was a file that does not exist locally (if
+       anything else failed too, 204 wins)
+  203  a dependency (requests, oss2) is missing -- the managed venv is
+       absent or half-built; remove ~/.python.venv/my-boox and re-run
+  204  action failed even after re-auth retry, or a file failed to upload
   205  re-auth step itself failed (no email configured, no code entered,
-       or the request-code/obtain-token API call itself failed)
-  206  no config file found and none could be resolved
+       stdin is not a terminal so no code could be prompted for, or the
+       request-code/obtain-token API call itself failed)
+  206  no config file found (search order exhausted, or the --config PATH
+       given does not exist)
 """)
 
 
@@ -1117,6 +2401,8 @@ def main(argv):
     config_flag = False
     create_config_flag = False
     create_config_path = None
+    run_tests = False
+    test_group = None
     rest = []
 
     i = 0
@@ -1129,11 +2415,25 @@ def main(argv):
             if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
                 config_override = argv[i + 1]
                 i += 1
+        elif a.startswith("--config="):
+            config_flag = True
+            config_override = a.split("=", 1)[1] or None
         elif a == "--create-config":
             create_config_flag = True
             if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
                 create_config_path = argv[i + 1]
                 i += 1
+        elif a.startswith("--create-config="):
+            create_config_flag = True
+            create_config_path = a.split("=", 1)[1] or None
+        elif a == "--run-tests":
+            run_tests = True
+            if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
+                test_group = argv[i + 1]
+                i += 1
+        elif a.startswith("--run-tests="):
+            run_tests = True
+            test_group = a.split("=", 1)[1] or None
         elif a in ("-h", "--help"):
             print_help(sys.stdout)
             return 0
@@ -1145,14 +2445,22 @@ def main(argv):
             rest.append(a)
         i += 1
 
+    if run_tests:
+        return run_self_tests(test_group)
+
     if create_config_flag:
         if create_config_path:
             path = os.path.expanduser(create_config_path)
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "w") as f:
-                f.write(CONFIG_TEMPLATE)
+            # Never clobber: by the time a config exists it holds a working
+            # token (and possibly a hand-tuned cache_path), and overwriting
+            # it with the blank template silently throws both away.
+            if os.path.exists(path):
+                sys.stderr.write(
+                    f"my-boox: refusing to overwrite existing file: {path}\n"
+                    f"my-boox: remove it first, or write the template elsewhere\n"
+                )
+                return 201
+            _write_file_atomic(path, CONFIG_TEMPLATE, mode=0o600)
             print(f"wrote template config to {path}")
         else:
             sys.stdout.write(CONFIG_TEMPLATE)
@@ -1172,13 +2480,25 @@ def main(argv):
         sys.stderr.write(f"my-boox: unknown command: {cmd} (expected send, ls, or del)\n")
         return 201
 
-    config_path = config_override or resolve_config_path(required=False)
+    if config_override:
+        config_path = os.path.expanduser(config_override)
+        if not os.path.isfile(config_path):
+            die(f"my-boox: config file not found: {config_path}", 206)
+    else:
+        # required=True: without a config there is no email to send a
+        # verification code to, so the run cannot succeed. Saying so up
+        # front (206) beats failing several requests later with the much
+        # vaguer "no email configured".
+        config_path = resolve_config_path(required=True)
     config = load_config(config_path)
 
     global API_PACING, API_RETRY_ATTEMPTS, API_RETRY_DELAY
     API_PACING = _config_float(config, "api_pacing_seconds", DEFAULT_PACING)
     API_RETRY_ATTEMPTS = _config_int(config, "api_retry_attempts", DEFAULT_RETRY_ATTEMPTS)
     API_RETRY_DELAY = _config_float(config, "api_retry_delay_seconds", DEFAULT_RETRY_DELAY)
+
+    # Last gate before anything touches the network.
+    _require_deps()
 
     try:
         if cmd == "send":
