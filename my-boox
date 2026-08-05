@@ -23,9 +23,12 @@ version. Run the one-time cleanup script (see README) before switching.
   - a central pacing/retry layer every outgoing request goes through
   - send and del follow the BOOXDrop web client's own call sequence, taken
     from a HAR capture of a working browser upload and delete:
-      send: OSS upload -> _revs_diff -> _bulk_docs (new_edits=false) ->
-            push/saveAndPush WITH cbMsg naming that document, so the
-            server adopts it rather than registering a second one
+      send: OSS upload -> _bulk_docs (new_edits=false, one request for
+            the whole batch) -> push/saveAndPush WITH cbMsg naming that
+            document, so the server adopts it rather than registering a
+            second one. The browser also sends a _revs_diff before the
+            write; it is a read-only query whose answer is discarded, so
+            it is not sent (see write_docs_batch).
       del:  _bulk_docs tombstone (one request for the whole batch) ->
             push/message/batchDelete for every id at once. The browser
             also sends a _revs_diff here; a send/delete round trip
@@ -300,7 +303,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.0"
+VERSION = "5.1"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -1100,22 +1103,6 @@ def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
     return cache["docs"]
 
 
-def neocloud_write_doc(cloud: str, session_id: str, doc_id: str, rev_str: str,
-                       revisions: Dict[str, Any], uid: str, basename: str,
-                       resource_type: str, remotename: str, size: int,
-                       sign_url_fn: Callable[[str], str],
-                       debug: bool = False) -> None:
-    """Write ONE /neocloud/ document. write_docs_batch() is the batched
-    equivalent and is what 'send' actually uses; this remains as the
-    single-document form."""
-    doc = _content_doc(doc_id, rev_str, revisions, uid, basename,
-                       resource_type, remotename, size, sign_url_fn)
-    neocloud_request(cloud, session_id, "POST", "_revs_diff",
-                      json_body={doc_id: [rev_str]}, debug=debug)
-    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
-                      json_body={"docs": [doc], "new_edits": False}, debug=debug)
-
-
 def _content_doc(doc_id: str, rev_str: str, revisions: Dict[str, Any], uid: str,
                  basename: str, resource_type: str, remotename: str, size: int,
                  sign_url_fn: Callable[[str], str]) -> Dict[str, Any]:
@@ -1288,14 +1275,22 @@ def finalize_send(cloud: str, token: Optional[str], item: Dict[str, Any],
 
 def write_docs_batch(cloud: str, session_id: str, items: Sequence[Dict[str, Any]],
                      debug: bool = False) -> None:
-    """Write every prepared document in ONE _revs_diff plus ONE _bulk_docs,
-    which is exactly the shape the browser uses -- its _revs_diff announces
-    every revision it knows about at once, and _bulk_docs takes a list. A
-    per-file write cost two paced requests per file for no benefit."""
+    """Write every prepared document in ONE _bulk_docs -- the browser sends
+    a list too, so a per-file write cost a paced request per file for no
+    benefit."""
     if not items:
         return
 
-    revs_diff_body = {item["doc_id"]: [item["rev"]] for item in items}
+    # The browser POSTs _revs_diff first, and we did too until it was
+    # measured costing 18s of a 28s send (a cold-cache 504 plus its backoff).
+    # It is a read-only query -- "which of these revisions do you not already
+    # have?" -- whose answer we discard, so it changes nothing and skipping it
+    # cannot affect the write. Kept here, commented, because it IS what the
+    # browser does: if a future delivery problem ever traces back to this,
+    # put it back first.
+    #     revs_diff_body = {item["doc_id"]: [item["rev"]] for item in items}
+    #     neocloud_request(cloud, session_id, "POST", "_revs_diff",
+    #                      json_body=revs_diff_body, debug=debug)
     docs = [
         _content_doc(item["doc_id"], item["rev"], item["revisions"], item["uid"],
                      item["basename"], item["resource_type"], item["remotename"],
@@ -1304,8 +1299,6 @@ def write_docs_batch(cloud: str, session_id: str, items: Sequence[Dict[str, Any]
     ]
 
     try:
-        neocloud_request(cloud, session_id, "POST", "_revs_diff",
-                         json_body=revs_diff_body, debug=debug)
         neocloud_request(cloud, session_id, "POST", "_bulk_docs",
                          json_body={"docs": docs, "new_edits": False}, debug=debug)
     except (BooxAPIError, BooxAuthError) as e:
@@ -2479,9 +2472,9 @@ class TestRegressions(unittest.TestCase):
         written = {}
 
         def fake_neocloud(cloud: Any, session_id: Any, method: Any, path: Any, json_body: Any = None, **k: Any) -> Any:
-            if path == "_revs_diff":
-                (doc_id, revs), = json_body.items()
-                written["doc_id"], written["rev"] = doc_id, revs[0]
+            if path == "_bulk_docs":
+                doc = json_body["docs"][0]
+                written["doc_id"], written["rev"] = doc["_id"], doc["_rev"]
             return {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2771,11 +2764,12 @@ class TestRegressions(unittest.TestCase):
         with mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
             write_docs_batch("example.invalid", "sess", items)
 
-        # 14 files -> exactly two requests, both carrying all 14.
-        self.assertEqual([p for p, _ in bodies], ["_revs_diff", "_bulk_docs"])
-        self.assertEqual(len(bodies[0][1]), 14)
-        self.assertEqual(len(bodies[1][1]["docs"]), 14)
-        self.assertIs(bodies[1][1]["new_edits"], False)
+        # 14 files -> exactly ONE request, carrying all 14. The browser's
+        # _revs_diff is deliberately not sent: it is a read-only query whose
+        # answer we discard (see write_docs_batch).
+        self.assertEqual([p for p, _ in bodies], ["_bulk_docs"])
+        self.assertEqual(len(bodies[0][1]["docs"]), 14)
+        self.assertIs(bodies[0][1]["new_edits"], False)
 
     def test_preflight_calls_are_made_once_per_run_not_once_per_file(self) -> None:
         module = sys.modules[__name__]
@@ -2938,13 +2932,16 @@ USAGE
 
 COMMANDS
   send FILE [FILE...]
-                    Upload one or more files, following exactly the call
-                    sequence the BOOXDrop web UI uses: upload to OSS,
-                    write our own /neocloud/ document via _revs_diff +
-                    _bulk_docs, then api/1/push/saveAndPush carrying
-                    'cbMsg' naming that document -- which makes the
-                    server adopt it instead of registering a second one.
-                    That is why one send now produces one row, not two.
+                    Upload one or more files, following the call sequence
+                    the BOOXDrop web UI uses: upload to OSS, write our own
+                    /neocloud/ document (one _bulk_docs for the whole
+                    batch), then api/1/push/saveAndPush carrying 'cbMsg'
+                    naming that document -- which makes the server adopt
+                    it instead of registering a second one. That is why
+                    one send produces one row, not two.
+                    The browser also posts a _revs_diff before the write;
+                    it is a read-only query whose answer is discarded, so
+                    it is not sent.
                     Skips any file whose name AND size already match
                     something already present (checked once per batch,
                     plus against files sent earlier in the same batch).

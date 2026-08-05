@@ -49,7 +49,7 @@ Notable fixes and discoveries along the way:
 
   | command | sequence |
   | --- | --- |
-  | `send` | OSS upload (https) → `_revs_diff` → `_bulk_docs` (`new_edits=false`) → `push/saveAndPush` **with `cbMsg`** naming that document |
+  | `send` | OSS upload (https) → `_bulk_docs` (`new_edits=false`) → `push/saveAndPush` **with `cbMsg`** naming that document |
   | `del` | `_bulk_docs` tombstone → `push/message/batchDelete` with the same id |
 
   Both halves of each are load-bearing:
@@ -83,10 +83,13 @@ Notable fixes and discoveries along the way:
     need a MIME parser for the same data.)
   - `_bulk_docs` takes the whole batch in one request, for both the
     document writes on `send` and the tombstones on `del`; `batchDelete`
-    already took an `ids` list. `send` keeps the `_revs_diff` the
-    browser sends before its write; `del` does not — a send/delete round
-    trip watched on the device confirmed the tombstone alone removes the
-    file, and it is a no-op optimisation in CouchDB terms.
+    already took an `ids` list. Neither sends the `_revs_diff` the browser
+    posts first: it is a read-only query ("which of these revisions do you
+    not already have?") whose answer we discard, so it cannot affect the
+    write — and it was measured costing 18s of a 28s send when it hit a
+    cold-cache 504. It is left commented in `write_docs_batch`, because it
+    *is* what the browser does: if a delivery problem ever traces back to
+    this, put it back first.
   - `uid` and the sync-gateway session are cached in the local cache file
     (never the token itself — only an 8-character tail, to key the entry),
     so a warm `ls` is a **single** request. A rejected session is refetched
@@ -312,7 +315,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.0**.
+Current release: **v5.1**.
 
 ## Type checking
 
