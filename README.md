@@ -173,8 +173,9 @@ email =
 token =
 cloud = eur.boox.com
 api_pacing_seconds = 1.5
-api_retry_attempts = 3
-api_retry_delay_seconds = 3.0
+api_retry_attempts = 5
+api_retry_delays_seconds = 3, 5, 10
+api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
 duplicate_check_on_send = true
 cache_path =
@@ -192,9 +193,22 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
   pacing.
 - `api_retry_attempts` — how many times to retry any single request after a
   transient server error (`502`/`503`/`504`, connection errors, timeouts)
-  before giving up on it.
-- `api_retry_delay_seconds` — base backoff delay between retries
-  (multiplied by the attempt number, so `3.0` gives 3s, then 6s).
+  before giving up on it. Default `5`: the gateway 504s at random, and a run
+  was observed losing three consecutive attempts on a request that a
+  neighbouring run answered in 0.12s. Each lost attempt costs ~15s.
+- `api_retry_delays_seconds` / `api_retry_delays_repeat_seconds` — pauses
+  before each retry: the first list opens, the second repeats once it is
+  exhausted. Defaults `3, 5, 10` then `3, 10`, giving 3, 5, 10, 3, 10, …
+  rather than a backoff that grows without bound. Retrying with **no** pause
+  was measured to simply hang again, so the pause is load-bearing. The older
+  single-valued `api_retry_delay_seconds` is still honoured as a fallback.
+
+  Retries are announced on stderr **without** `-D`, with how long the failed
+  attempt took, so a slow run explains itself and you can Ctrl+C out of it:
+
+  ```
+  my-boox: HTTP 504 from …/_changes -- attempt 1/5 failed after 15s; retrying in 3s...  (Ctrl-C to stop)
+  ```
 - `api_timeout_seconds` — how long to wait for one request before giving up.
   Default `30.0`, and **lowering it is a trap**. When `/neocloud/_changes`
   misses its server-side cache — reliably the **first read after a write** —
@@ -327,7 +341,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.3**.
+Current release: **v5.4**.
 
 ## Type checking
 

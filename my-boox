@@ -239,8 +239,9 @@ email =
 token =
 cloud = eur.boox.com
 api_pacing_seconds = 1.5
-api_retry_attempts = 3
-api_retry_delay_seconds = 3.0
+api_retry_attempts = 5
+api_retry_delays_seconds = 3, 5, 10
+api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
 duplicate_check_on_send = true
 send_skip_optional_calls = false
@@ -274,8 +275,18 @@ cache_path =
 # fallback values, so the template and the actual defaults can't drift
 # apart.
 DEFAULT_PACING = 1.5      # seconds between requests
-DEFAULT_RETRY_ATTEMPTS = 3
-DEFAULT_RETRY_DELAY = 3.0  # seconds; multiplied by attempt number
+# 5 rather than 3: the gateway 504s at random, and a run was observed
+# losing three consecutive attempts on the same request that a neighbouring
+# run answered in 0.12s. Each lost attempt costs ~15s, so this trades a
+# longer worst case for far fewer outright failures.
+DEFAULT_RETRY_ATTEMPTS = 5
+# 3s, 5s, 10s to open, then 3s, 10s repeating: 3, 5, 10, 3, 10, 3, 10, ...
+# A failed attempt already costs ~15s of gateway hang, so an ever-growing
+# backoff mostly adds waiting on top of that. Alternating a short and a long
+# pause keeps giving the backend both kinds of gap without the total running
+# away (retrying instantly was measured to just hang again).
+DEFAULT_RETRY_DELAYS = (3.0, 5.0, 10.0)
+DEFAULT_RETRY_DELAYS_REPEAT = (3.0, 10.0)
 # Must stay LONGER than the gateway's own ~15s timeout. When
 # /neocloud/_changes misses its server-side cache (reliably the first read
 # after a write) nginx hangs ~15s, returns 504, and an immediate retry then
@@ -300,6 +311,28 @@ def _config_int(config: configparser.ConfigParser, key: str, default: int) -> in
         return default
 
 
+def _config_delays(config: configparser.ConfigParser, key: str,
+                   default: Sequence[float],
+                   legacy_key: str = "") -> Sequence[float]:
+    """Parse a comma-separated list of seconds. `legacy_key` names an older
+    single-value setting to fall back on, so an existing config keeps
+    working."""
+    raw = config["default"].get(key, "").strip()
+    if not raw:
+        legacy = config["default"].get(legacy_key, "").strip() if legacy_key else ""
+        if not legacy:
+            return default
+        try:
+            return (float(legacy),)
+        except ValueError:
+            return default
+    try:
+        delays = tuple(float(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        return default
+    return delays or default
+
+
 def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> bool:
     try:
         return config["default"].getboolean(key, fallback=default)
@@ -307,7 +340,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.3"
+VERSION = "5.4"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -402,7 +435,9 @@ def load_config(path: str) -> configparser.ConfigParser:
     config["default"].setdefault("cloud", DEFAULT_CLOUD)
     config["default"].setdefault("api_pacing_seconds", str(DEFAULT_PACING))
     config["default"].setdefault("api_retry_attempts", str(DEFAULT_RETRY_ATTEMPTS))
-    config["default"].setdefault("api_retry_delay_seconds", str(DEFAULT_RETRY_DELAY))
+    # NOT setdefault-ed: _config_delays needs to see whether the key is
+    # genuinely absent, otherwise an existing api_retry_delay_seconds could
+    # never be honoured as the fallback.
     config["default"].setdefault("api_timeout_seconds", str(DEFAULT_TIMEOUT))
     config["default"].setdefault("duplicate_check_on_send", "true")
     config["default"].setdefault("send_skip_optional_calls", "false")
@@ -585,7 +620,8 @@ def _get(d: Any, *keys: str) -> Any:
 # _paced_request() safe to call regardless of init order).
 _api_pacing = DEFAULT_PACING
 _api_retry_attempts = DEFAULT_RETRY_ATTEMPTS
-_api_retry_delay = DEFAULT_RETRY_DELAY
+_api_retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS
+_api_retry_delays_repeat: Sequence[float] = DEFAULT_RETRY_DELAYS_REPEAT
 _api_timeout = DEFAULT_TIMEOUT
 
 _last_request_time = 0.0
@@ -598,6 +634,16 @@ def _debug_timing(paced_seconds: float, request_seconds: float, outcome: str) ->
     things, and neither is the retry backoff that follows."""
     pacing = f"paced {paced_seconds:.1f}s + " if paced_seconds > 0 else ""
     sys.stderr.write(f"    ~ {pacing}server {request_seconds:.2f}s -> {outcome}\n")
+
+
+def _delay_for_attempt(attempt: int) -> float:
+    """Seconds to wait before retry number `attempt` (1-based): the opening
+    sequence first, then the repeating one -- 3, 5, 10, 3, 10, 3, 10, ..."""
+    opening = _api_retry_delays or DEFAULT_RETRY_DELAYS
+    if attempt <= len(opening):
+        return opening[attempt - 1]
+    repeat = _api_retry_delays_repeat or DEFAULT_RETRY_DELAYS_REPEAT
+    return repeat[(attempt - 1 - len(opening)) % len(repeat)]
 
 
 def _paced_request(method: str, url: str, headers: Optional[Dict[str, str]] = None,
@@ -665,12 +711,16 @@ def _paced_request(method: str, url: str, headers: Optional[Dict[str, str]] = No
             # (in 0.12s). Every fast retry on record had slept first, so the
             # pause is doing the work -- the backend needs a moment, and
             # hammering it straight away just lands in the same state.
-            delay = _api_retry_delay * attempt
-            if debug:
-                sys.stderr.write(
-                    f">>> request failed (attempt {attempt}/{attempts}): "
-                    f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
-                )
+            delay = _delay_for_attempt(attempt)
+            # Printed unconditionally, not just under -D: a run can sit here
+            # for a minute, and the user is entitled to see why and to
+            # Ctrl-C out of it rather than stare at a frozen terminal.
+            hint = "  (Ctrl-C to stop)" if attempt == 1 else ""
+            sys.stderr.write(
+                f"my-boox: {last_err} -- attempt {attempt}/{attempts} failed "
+                f"after {time.monotonic() - started:.0f}s; "
+                f"retrying in {delay:.0f}s...{hint}\n"
+            )
             time.sleep(delay)
 
     if not idempotent:
@@ -1479,6 +1529,13 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
 
         run_preamble_once()
 
+        # Batching moved every OSS transfer ahead of the first saveAndPush,
+        # so nothing was printed until all of them finished -- a 14-file
+        # batch sat silent for a minute. Announce each one as it starts.
+        pending = len(filenames) - len(missing) - len(failed) - len(uploaded)
+        print(f"uploading: {basename} ({len(uploaded) + 1}/{pending + len(uploaded)})",
+              flush=True)
+
         def upload_action(token: Optional[str], filename: Any = filename) -> Any:
             return upload_one(cloud, token, filename, debug=debug)
 
@@ -2037,7 +2094,7 @@ def _no_pacing(module: Any, requests_stub: Any = None,
     spend real seconds) and, optionally, a stubbed `requests` module."""
     patches = [
         mock.patch.object(module, "_api_pacing", 0),
-        mock.patch.object(module, "_api_retry_delay", 0),
+        mock.patch.object(module, "_api_retry_delays", (0.0,)),
         mock.patch.object(module, "_last_request_time", 0.0),
         mock.patch.object(module, "time", mock.Mock(monotonic=time.monotonic,
                                                     sleep=lambda _s: None,
@@ -2963,20 +3020,103 @@ class TestRegressions(unittest.TestCase):
     # -- v5.2 made the first retry immediate on the theory that the pause
     #    bought nothing. Measured against the real gateway it was worse: the
     #    immediate attempt hung another ~15s and 504'd, and only the attempt
-    #    after a pause succeeded. The delay stays.
-    def test_every_retry_waits_including_the_first(self) -> None:
+    #    after a pause succeeded. The delay stays, and cycles rather than
+    #    growing without bound.
+    def test_retry_delays_cycle_and_every_retry_waits(self) -> None:
         module = sys.modules[__name__]
         slept: List[float] = []
         stub = _FakeRequests([_FakeResponse(504, {}), _FakeResponse(504, {}),
                               _FakeResponse(200, {"result_code": 0})])
         with mock.patch.object(module, "_api_pacing", 0), \
-             mock.patch.object(module, "_api_retry_delay", 3.0), \
+             mock.patch.object(module, "_api_retry_delays", (3.0, 5.0, 10.0)), \
              mock.patch.object(module, "_api_retry_attempts", 3), \
              mock.patch.object(module, "requests", stub), \
              mock.patch.object(module.time, "sleep", lambda s: slept.append(s)):
             resp = _paced_request("GET", "https://example.invalid/x")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(slept, [3.0, 6.0])   # 3s before retry 1, 6s before retry 2
+        self.assertEqual(slept, [3.0, 5.0])   # opening sequence
+
+    # -- batching moved every OSS transfer ahead of the first saveAndPush,
+    #    so a 14-file send printed nothing for about a minute.
+    def test_send_announces_each_upload_as_it_starts(self) -> None:
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+            paths: List[str] = []
+            for name in ("a.pdf", "b.pdf", "c.pdf"):
+                p = os.path.join(tmpdir, name)
+                with open(p, "w") as handle:
+                    handle.write("x")
+                paths.append(p)
+
+            with mock.patch.object(module, "with_reauth", side_effect=_run_action), \
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "upload_one",
+                                   side_effect=lambda c, t, f, **k: _fake_item(
+                                       os.path.basename(f), "1-a", os.path.basename(f), 1)), \
+                 mock.patch.object(module, "finalize_send",
+                                   return_value=("d", "1-a", "x.pdf", 1, None, None)):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cmd_send(config, config_path, paths, debug=False)
+
+        out = stdout.getvalue()
+        self.assertIn("uploading: a.pdf (1/3)", out)
+        self.assertIn("uploading: b.pdf (2/3)", out)
+        self.assertIn("uploading: c.pdf (3/3)", out)
+        # progress comes before the confirmation, not after
+        self.assertLess(out.index("uploading: a.pdf"), out.index("sent:"))
+
+    def test_delays_cycle_after_the_last_one_and_are_announced(self) -> None:
+        module = sys.modules[__name__]
+        slept: List[float] = []
+        stub = _FakeRequests([_FakeResponse(504, {})] * 4 + [_FakeResponse(200, {"result_code": 0})])
+        stderr = io.StringIO()
+        with mock.patch.object(module, "_api_pacing", 0), \
+             mock.patch.object(module, "_api_retry_delays", (3.0, 5.0, 10.0)), \
+             mock.patch.object(module, "_api_retry_attempts", 5), \
+             mock.patch.object(module, "requests", stub), \
+             mock.patch.object(module.time, "sleep", lambda s: slept.append(s)), \
+             contextlib.redirect_stderr(stderr):
+            resp = _paced_request("GET", "https://example.invalid/x")
+
+        self.assertEqual(resp.status_code, 200)
+        # opening 3, 5, 10 then the repeating 3, 10 -- never grows without bound
+        self.assertEqual(slept, [3.0, 5.0, 10.0, 3.0])
+
+        out = stderr.getvalue()
+        # Visible WITHOUT -D: a run can sit here for a minute.
+        self.assertIn("attempt 1/5 failed", out)
+        self.assertIn("retrying in 3s", out)
+        self.assertIn("Ctrl-C to stop", out)
+        self.assertEqual(out.count("Ctrl-C to stop"), 1)   # hinted once, not every time
+
+    def test_legacy_single_retry_delay_key_still_works(self) -> None:
+        config = configparser.ConfigParser()
+        config["default"] = {"api_retry_delay_seconds": "2.5"}
+        got = _config_delays(config, "api_retry_delays_seconds", DEFAULT_RETRY_DELAYS,
+                             legacy_key="api_retry_delay_seconds")
+        self.assertEqual(list(got), [2.5])
+
+        config["default"]["api_retry_delays_seconds"] = "1, 2, 4"
+        got = _config_delays(config, "api_retry_delays_seconds", DEFAULT_RETRY_DELAYS,
+                             legacy_key="api_retry_delay_seconds")
+        self.assertEqual(list(got), [1.0, 2.0, 4.0])
+
+        config["default"]["api_retry_delays_seconds"] = "nonsense"
+        got = _config_delays(config, "api_retry_delays_seconds", DEFAULT_RETRY_DELAYS)
+        self.assertEqual(tuple(got), DEFAULT_RETRY_DELAYS)
+
+    def test_delay_schedule_opens_then_repeats(self) -> None:
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "_api_retry_delays", (3.0, 5.0, 10.0)), \
+             mock.patch.object(module, "_api_retry_delays_repeat", (3.0, 10.0)):
+            schedule = [_delay_for_attempt(i) for i in range(1, 10)]
+        self.assertEqual(schedule, [3.0, 5.0, 10.0, 3.0, 10.0, 3.0, 10.0, 3.0, 10.0])
 
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
@@ -3130,8 +3270,9 @@ CONFIG
       token =
       cloud = eur.boox.com
       api_pacing_seconds = 1.5
-      api_retry_attempts = 3
-      api_retry_delay_seconds = 3.0
+      api_retry_attempts = 5
+      api_retry_delays_seconds = 3, 5, 10
+api_retry_delays_repeat_seconds = 3, 10
       duplicate_check_on_send = true
 
   email  -- the address tied to your Onyx account. Required: this is who
@@ -3144,6 +3285,16 @@ CONFIG
             this tool makes. 0 disables it.
   api_retry_attempts       -- how many times to retry any single request
             after a transient server error before giving up on it.
+            Default 5: the gateway 504s at random, and a run was seen
+            losing three consecutive attempts on a request a neighbouring
+            run answered in 0.12s. Each lost attempt costs ~15s, so this
+            trades a longer worst case for far fewer hard failures.
+  api_retry_delays_seconds -- pauses before each retry, comma separated.
+            Default '3, 5, 10'. Retrying with NO pause was measured to just
+            hang again, so the pause is load-bearing.
+  api_retry_delays_repeat_seconds -- pauses used once the list above is
+            exhausted, cycled. Default '3, 10', giving 3, 5, 10, 3, 10, ...
+            rather than a backoff that grows without bound.
   api_retry_delay_seconds  -- base backoff delay between retries
             (multiplied by the attempt number, so e.g. 3.0 gives 3s, 6s).
   api_timeout_seconds      -- how long to wait for a single request before
@@ -3338,10 +3489,15 @@ def main(argv: Sequence[str]) -> int:
         config_path = resolve_config_path(required=True)
     config = load_config(config_path)
 
-    global _api_pacing, _api_retry_attempts, _api_retry_delay, _api_timeout
+    global _api_pacing, _api_retry_attempts, _api_retry_delays
+    global _api_retry_delays_repeat, _api_timeout
     _api_pacing = _config_float(config, "api_pacing_seconds", DEFAULT_PACING)
     _api_retry_attempts = _config_int(config, "api_retry_attempts", DEFAULT_RETRY_ATTEMPTS)
-    _api_retry_delay = _config_float(config, "api_retry_delay_seconds", DEFAULT_RETRY_DELAY)
+    _api_retry_delays = _config_delays(config, "api_retry_delays_seconds",
+                                       DEFAULT_RETRY_DELAYS,
+                                       legacy_key="api_retry_delay_seconds")
+    _api_retry_delays_repeat = _config_delays(config, "api_retry_delays_repeat_seconds",
+                                              DEFAULT_RETRY_DELAYS_REPEAT)
     _api_timeout = _config_float(config, "api_timeout_seconds", DEFAULT_TIMEOUT)
 
     # Last gate before anything touches the network.
