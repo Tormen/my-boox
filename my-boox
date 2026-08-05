@@ -41,7 +41,7 @@ version. Run the one-time cleanup script (see README) before switching.
 
 Usage:
   my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]
-  my-boox [-D|--debug] [--config PATH] ls|list
+  my-boox [-D|--debug] [--config PATH] [-c|--cached] ls|list
   my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]
   my-boox [--config [PATH]]         # print resolved config path and exit
   my-boox [--create-config [PATH]]  # print (or write) a template config
@@ -141,6 +141,11 @@ def _should_skip_venv_bootstrap(argv: Optional[Sequence[str]] = None) -> bool:
     if any(arg == "--run-tests" or arg.startswith("--run-tests=") for arg in args):
         return True
     if any(arg in ("-h", "--help", "-V", "--version") for arg in args):
+        return True
+    # 'ls --cached' reads the local mirror and makes no request, so it needs
+    # neither dependency -- and should still work if the venv is broken.
+    if (("--cached" in args or "-c" in args)
+            and not any(a in ("send", "del", "delete") for a in args)):
         return True
     return not any(arg in KNOWN_CMDS for arg in args)
 
@@ -340,7 +345,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.4"
+VERSION = "5.5"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -1151,6 +1156,8 @@ def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
 
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
     store_session_in_cache(cache, cloud, token, uid, session_id)
+    # Stamped so 'ls --cached' can say how old the answer it is giving is.
+    cache["refreshed_at"] = int(time.time())
     save_cache(cache_path, cache)
     return cache["docs"]
 
@@ -1697,15 +1704,47 @@ def group_docs(docs: Docs) -> List[Dict[str, Any]]:
     return out
 
 
+def _describe_age(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "age unknown"
+    if seconds < 90:
+        return f"{seconds}s old"
+    if seconds < 5400:
+        return f"{seconds // 60}m old"
+    if seconds < 172800:
+        return f"{seconds // 3600}h old"
+    return f"{seconds // 86400}d old"
+
+
 def cmd_ls(config: configparser.ConfigParser, config_path: str,
-           debug: bool = False) -> List[Dict[str, Any]]:
+           debug: bool = False, cached: bool = False) -> List[Dict[str, Any]]:
+    """List files. Normally refreshes from /neocloud/ first; with cached=True
+    it prints the local mirror and makes no request at all.
+
+    The web client behaves like the cached mode by default -- it paints from
+    its local PouchDB replica and syncs afterwards, which is why it feels
+    instant and also why it will happily show an empty list for an account
+    that has files. Here that is opt-in, and the output says how stale it
+    might be."""
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     cache_path = resolve_cache_path(config, config_path)
 
-    def action(token: Optional[str]) -> Any:
-        return refresh_cache(cloud, token, cache_path, debug=debug)
+    if cached:
+        cache = load_cache(cache_path)
+        docs = cache["docs"]
+        refreshed_at = cache.get("refreshed_at")
+        age = int(time.time()) - int(refreshed_at) if refreshed_at else None
+        # stderr, so a piped table stays clean
+        sys.stderr.write(
+            f"my-boox: showing the local cache ({_describe_age(age)}), no "
+            f"request made -- run 'my-boox ls' for the authoritative list\n"
+        )
+    else:
+        def action(token: Optional[str]) -> Any:
+            return refresh_cache(cloud, token, cache_path, debug=debug)
 
-    docs = with_reauth(action, config, config_path, debug=debug) or {}
+        docs = with_reauth(action, config, config_path, debug=debug) or {}
+
     groups = group_docs(docs)
 
     # I would expect LC_ALL to be set but it may not be (kept from upstream,
@@ -3118,6 +3157,76 @@ class TestRegressions(unittest.TestCase):
             schedule = [_delay_for_attempt(i) for i in range(1, 10)]
         self.assertEqual(schedule, [3.0, 5.0, 10.0, 3.0, 10.0, 3.0, 10.0, 3.0, 10.0])
 
+    # -- the web client paints from its local replica first, which is why it
+    #    feels instant (and why it can show "No Data" for a full account).
+    #    'ls --cached' is the same trade, made explicit.
+    def test_cached_ls_makes_no_request_and_flags_its_age(self) -> None:
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+            save_cache(cache_path, {
+                "last_seq": "9",
+                "refreshed_at": int(time.time()) - 7200,
+                "docs": {"d1": {"name": "kept.pdf", "size": 5, "rev": "1-a",
+                                "updatedAt": 1}},
+            })
+
+            refresh = mock.Mock()
+            with mock.patch.object(module, "refresh_cache", refresh), \
+                 mock.patch.object(module, "with_reauth", refresh):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                     contextlib.redirect_stderr(stderr):
+                    groups = cmd_ls(config, config_path, cached=True)
+
+        refresh.assert_not_called()                 # zero network
+        self.assertEqual([g["name"] for g in groups], ["kept.pdf"])
+        self.assertIn("kept.pdf", stdout.getvalue())   # table on stdout
+        note = stderr.getvalue()                       # notice on stderr
+        self.assertIn("local cache", note)
+        self.assertIn("2h old", note)
+
+    def test_cached_ls_without_a_prior_refresh_says_age_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(stderr):
+                groups = cmd_ls(config, config_path, cached=True)
+        self.assertEqual(groups, [])
+        self.assertIn("age unknown", stderr.getvalue())
+
+    def test_refresh_stamps_when_it_last_saw_the_server(self) -> None:
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_request",
+                                   return_value={"last_seq": "1", "results": []}):
+                refresh_cache("example.invalid", "tok", cache_path)
+            stamped = load_cache(cache_path).get("refreshed_at")
+        self.assertIsNotNone(stamped)
+        assert stamped is not None      # narrows Optional for the checker
+        self.assertLessEqual(abs(int(time.time()) - int(stamped)), 5)
+
+    def test_cached_is_rejected_for_commands_other_than_ls(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = main(["--cached", "del", "abc"])
+        self.assertEqual(rc, 201)
+        self.assertIn("only applies to 'ls'", stderr.getvalue())
+
+    def test_cached_ls_needs_no_venv_bootstrap(self) -> None:
+        self.assertTrue(_should_skip_venv_bootstrap(["ls", "--cached"]))
+        self.assertTrue(_should_skip_venv_bootstrap(["-c", "ls"]))   # short form too
+        self.assertFalse(_should_skip_venv_bootstrap(["ls"]))
+        # --cached is meaningless for a send, and that run does need the venv
+        self.assertFalse(_should_skip_venv_bootstrap(["send", "--cached", "a.pdf"]))
+
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
             neocloud_delete_doc("example.invalid", "sess", "docid", "no-dash-here")
@@ -3205,6 +3314,9 @@ COMMANDS
   ls, list         List files, refreshing the local cache incrementally
                     from /neocloud/ first (cheap after the first run).
                     Use the ID shown with 'del'.
+                    With -c/--cached, prints the local cache instead and
+                    makes no request at all -- instant, but only as current
+                    as the last real 'ls'.
 
   del ID [ID...]   Delete one or more files by ID (as shown by 'ls'),
                     following the web UI: tombstone the /neocloud/
@@ -3235,6 +3347,13 @@ new token, saves that token back to the config file, and retries the
 command once -- no separate login step to run by hand.
 
 OPTIONS
+  -c, --cached       'ls' only: print the local cache and make no request
+                    at all. Instant, and works even if the network or the
+                    managed venv is unavailable, but only as current as the
+                    last real 'ls' -- the output says how old it is. This is
+                    what the web client does by default (it paints from its
+                    local replica first), which is why it can show an empty
+                    list for an account that has files.
   -D, --debug        Print the JSON of every API call to stderr, with
                     credentials (token, session_id, verification code, STS
                     keys, signed-URL signatures) replaced by a length
@@ -3374,6 +3493,7 @@ EXAMPLES
   my-boox ls
   my-boox del <id>
   my-boox del <id1> <id2>
+  my-boox ls --cached                  # instant, from the local mirror
   my-boox -D ls                        # with raw API responses on stderr
 
 EXIT CODES
@@ -3400,6 +3520,7 @@ def main(argv: Sequence[str]) -> int:
     create_config_path = None
     run_tests = False
     test_group = None
+    cached = False
     rest = []
 
     i = 0
@@ -3407,6 +3528,8 @@ def main(argv: Sequence[str]) -> int:
         a = argv[i]
         if a in ("-D", "--debug"):
             debug = True
+        elif a in ("-c", "--cached"):
+            cached = True
         elif a == "--config":
             config_flag = True
             if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
@@ -3500,8 +3623,15 @@ def main(argv: Sequence[str]) -> int:
                                               DEFAULT_RETRY_DELAYS_REPEAT)
     _api_timeout = _config_float(config, "api_timeout_seconds", DEFAULT_TIMEOUT)
 
-    # Last gate before anything touches the network.
-    _require_deps()
+    if cached and cmd not in ("ls", "list"):
+        sys.stderr.write(
+            f"my-boox: --cached only applies to 'ls' (got '{cmd}')\n")
+        return 201
+
+    # Last gate before anything touches the network. A cached listing makes
+    # no request, so it must not require the network libraries.
+    if not cached:
+        _require_deps()
 
     try:
         if cmd == "send":
@@ -3512,7 +3642,7 @@ def main(argv: Sequence[str]) -> int:
             return 0
 
         if cmd in ("ls", "list"):
-            cmd_ls(config, config_path, debug=debug)
+            cmd_ls(config, config_path, debug=debug, cached=cached)
             return 0
 
         if cmd in ("del", "delete"):

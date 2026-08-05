@@ -341,7 +341,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.4**.
+Current release: **v5.5**.
 
 ## Type checking
 
