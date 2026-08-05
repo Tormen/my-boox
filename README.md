@@ -160,6 +160,7 @@ cloud = eur.boox.com
 api_pacing_seconds = 1.5
 api_retry_attempts = 3
 api_retry_delay_seconds = 3.0
+api_timeout_seconds = 30.0
 duplicate_check_on_send = true
 cache_path =
 ```
@@ -179,6 +180,20 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
   before giving up on it.
 - `api_retry_delay_seconds` — base backoff delay between retries
   (multiplied by the attempt number, so `3.0` gives 3s, then 6s).
+- `api_timeout_seconds` — how long to wait for one request before giving up.
+  Default `30.0`, and **lowering it is a trap**. When `/neocloud/_changes`
+  misses its server-side cache — reliably the **first read after a write** —
+  the gateway hangs ~15s, returns `504`, and a retry then answers in ~0.13s:
+  receiving that `504` is what marks the work finished. Hanging up at 8s was
+  measured and is strictly worse — the upstream keeps grinding, every retry
+  hits the same cold cache, and the call fails after burning the whole retry
+  budget.
+
+  Only **safe** calls are retried. `push/saveAndPush` and the two
+  verification-code calls are never replayed automatically: a `504` means the
+  gateway stopped waiting, not that the server did nothing, so a blind retry
+  could register the same push twice. Those failures say so and point you at
+  `my-boox ls`.
 - `duplicate_check_on_send` — `true`/`false`. When `true` (default),
   `send` skips any file whose name and size already match something on
   your account. Set `false` to always upload regardless.
@@ -297,7 +312,27 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v4.1**.
+Current release: **v5.0**.
+
+## Type checking
+
+`pyright` in strict mode, clean:
+
+```sh
+pyright            # 0 errors, 0 warnings, 0 informations
+```
+
+`my-boox.py` is a symlink to the extensionless `my-boox`, because pyright
+only analyses `.py` files.
+
+Four inference-only rules (`reportUnknown{Variable,Member,Argument,Lambda}Type`)
+are relaxed in `pyrightconfig.json`. Everything this script handles is JSON
+from an API that makes no guarantees about its own fields — sizes and
+timestamps arrive as numbers *or* strings, which is exactly the crash that
+`_as_int` exists for — so modelling the payloads as `TypedDict`s would encode
+promises the server does not keep. Every rule that catches a real defect
+(unbound locals, `Optional` access, bad arguments, redeclarations) stays at
+strict's default and reports zero.
 
 ## Exit codes
 

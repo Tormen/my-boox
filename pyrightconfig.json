@@ -1,0 +1,10 @@
+{
+  "include": ["my-boox.py"],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.9",
+  "reportUnknownVariableType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportMissingModuleSource": "none"
+}
