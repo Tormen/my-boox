@@ -58,6 +58,13 @@ directly (its `boox.py`, `send_file.py`, `obtain_token.py`,
   this feature existed, or via the website, aren't in the state file, so
   `del` on those only finds (at most) the `saveAndPush`-created document via
   discovery — see the note in Use below.
+- **A central pacing/retry layer for every request.** Multi-file `send`
+  batches were hitting `502`/`504` errors from Onyx's backend under
+  back-to-back requests — initially fixed with `send`-specific retry
+  logic, then generalized: every outgoing request in the whole tool (not
+  just `send`, also `ls` and `del`) now routes through one function that
+  paces requests and retries transient failures with backoff, configurable
+  via `api_pacing_seconds`/`api_retry_attempts`/`api_retry_delay_seconds`.
 - **A separator line sized to your actual filenames**, not a fixed 57-dash
   string.
 - **A fixed remote-filename bug**: the upstream code produced names like
@@ -93,9 +100,9 @@ Template:
 email =
 token =
 cloud = eur.boox.com
-send_pacing_seconds = 1.5
-send_retry_attempts = 3
-send_retry_delay_seconds = 3.0
+api_pacing_seconds = 1.5
+api_retry_attempts = 3
+api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
 ```
 
@@ -104,12 +111,15 @@ blank — it gets filled in automatically the first time you run a command
 and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 (`eur.boox.com` for EU, `push.boox.com` for US/VN).
 
-- `send_pacing_seconds` — pause between files in a multi-file `send`.
-  Onyx's backend throws more `502`/`504` errors under back-to-back
-  requests; this reduces how often that happens. `0` disables pacing.
-- `send_retry_attempts` — how many times to retry a file after a
-  transient server error before giving up on it.
-- `send_retry_delay_seconds` — base backoff delay between retries
+- `api_pacing_seconds` — minimum interval between **any** two requests this
+  tool makes (`send`, `ls`, `del` alike, and every request within each of
+  them). Onyx's backend throws more `502`/`503`/`504` errors under
+  back-to-back requests; this reduces how often that happens. `0` disables
+  pacing.
+- `api_retry_attempts` — how many times to retry any single request after a
+  transient server error (`502`/`503`/`504`, connection errors, timeouts)
+  before giving up on it.
+- `api_retry_delay_seconds` — base backoff delay between retries
   (multiplied by the attempt number, so `3.0` gives 3s, then 6s).
 - `duplicate_check_on_send` — `true`/`false`. When `true` (default),
   `send` skips any file whose name and size already match something on
@@ -150,13 +160,13 @@ With multiple files, `send` keeps going even if one fails (missing file, transie
 server error, etc.) — failures are summarized at the end and the exit code is
 nonzero if anything didn't make it, but the rest of the batch still gets sent.
 
-On a transient server error — `502`/`504`/read timeouts, which Onyx's own
-web client also hits occasionally — `send` retries that one file (3 times
-with backoff by default) before giving up on it. With more than one file,
-it also pauses briefly between each (1.5s by default) to reduce how often
-those errors happen in the first place. Both are configurable — see
-`send_retry_attempts`, `send_retry_delay_seconds`, and
-`send_pacing_seconds` under Configure above.
+Every request any command makes — `send`, `ls`, and `del` alike, including
+each of the several requests a single `send` involves under the hood — goes
+through the same central pacing/retry layer: a minimum interval between
+requests, and automatic retries with backoff on `502`/`503`/`504`,
+connection errors, or timeouts (which Onyx's own web client also hits
+occasionally). Both are configurable — see `api_pacing_seconds`,
+`api_retry_attempts`, and `api_retry_delay_seconds` under Configure above.
 
 `send` also skips any file whose name **and** size already match something
 already on your account — checked once per batch (plus against files already
@@ -166,6 +176,10 @@ the same file twice, doesn't create duplicate uploads. Set
 
 > **`del` fully works for anything sent by `my-boox` itself** (tracked via
 > a small `<config>.neocloud-state.json` file created alongside your config).
+> Each id is processed independently — printed as `deleted: <id>` as soon
+> as it's done, and if one fails (even after retries), the rest of the
+> batch still goes ahead rather than aborting, with a summary and nonzero
+> exit code at the end if anything genuinely failed.
 > For files sent before this feature existed, or via the website, `del`
 > still only runs the legacy `push/message/batchDelete` call, which is
 > confirmed to *not* reliably remove the file from the device — use the

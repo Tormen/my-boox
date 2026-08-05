@@ -123,9 +123,9 @@ CONFIG_TEMPLATE = """[default]
 email =
 token =
 cloud = eur.boox.com
-send_pacing_seconds = 1.5
-send_retry_attempts = 3
-send_retry_delay_seconds = 3.0
+api_pacing_seconds = 1.5
+api_retry_attempts = 3
+api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
 """
 
@@ -232,9 +232,9 @@ def load_config(path):
     config["default"].setdefault("email", "")
     config["default"].setdefault("token", "")
     config["default"].setdefault("cloud", DEFAULT_CLOUD)
-    config["default"].setdefault("send_pacing_seconds", str(SEND_BATCH_PACING))
-    config["default"].setdefault("send_retry_attempts", str(SEND_RETRY_ATTEMPTS))
-    config["default"].setdefault("send_retry_delay_seconds", str(SEND_RETRY_BASE_DELAY))
+    config["default"].setdefault("api_pacing_seconds", str(SEND_BATCH_PACING))
+    config["default"].setdefault("api_retry_attempts", str(SEND_RETRY_ATTEMPTS))
+    config["default"].setdefault("api_retry_delay_seconds", str(SEND_RETRY_BASE_DELAY))
     config["default"].setdefault("duplicate_check_on_send", "true")
     return config
 
@@ -284,6 +284,62 @@ def _get(d, *keys):
     return cur
 
 
+# Populated once in main() from config (api_pacing_seconds/api_retry_attempts/
+# api_retry_delay_seconds); these module-level defaults are the fallback for
+# any code path that runs before that (there isn't one currently, but keeps
+# _paced_request() safe to call regardless of init order).
+API_PACING = SEND_BATCH_PACING
+API_RETRY_ATTEMPTS = SEND_RETRY_ATTEMPTS
+API_RETRY_DELAY = SEND_RETRY_BASE_DELAY
+
+_LAST_REQUEST_TIME = 0.0
+
+
+def _paced_request(method, url, headers=None, params=None, data=None,
+                     timeout=30, debug=False):
+    """Single choke point for every outgoing HTTP request this tool makes --
+    both api/1/* (Bearer-authenticated) and /neocloud/* (cookie-
+    authenticated) calls route through here. Enforces a minimum pacing
+    interval between consecutive requests and retries transient failures
+    (connection errors, timeouts, 502/503/504) with backoff before giving
+    up. Onyx's backend throws noticeably more of these under back-to-back
+    requests -- centralizing this here fixes it for every command (send,
+    del, ls) uniformly, rather than each command needing its own retry
+    logic. Non-transient responses (200, 404, 4xx, etc.) are returned as-is
+    on the first try; interpreting them is the caller's job."""
+    global _LAST_REQUEST_TIME
+    last_err = None
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        if API_PACING > 0:
+            wait = API_PACING - (time.monotonic() - _LAST_REQUEST_TIME)
+            if wait > 0:
+                time.sleep(wait)
+        _LAST_REQUEST_TIME = time.monotonic()
+
+        try:
+            resp = requests.request(method, url, headers=headers, params=params,
+                                      data=data, timeout=timeout)
+        except requests.RequestException as e:
+            last_err = e
+        else:
+            if resp.status_code not in (502, 503, 504):
+                return resp
+            last_err = BooxAPIError(f"HTTP {resp.status_code} from {url}")
+
+        if attempt < API_RETRY_ATTEMPTS:
+            delay = API_RETRY_DELAY * attempt
+            if debug:
+                sys.stderr.write(
+                    f">>> request failed (attempt {attempt}/{API_RETRY_ATTEMPTS}): "
+                    f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
+                )
+            time.sleep(delay)
+
+    if isinstance(last_err, requests.RequestException):
+        raise BooxAPIError(f"network error calling {url}: {last_err}") from last_err
+    raise last_err
+
+
 def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
              params=None, api="api/1", debug=False):
     headers = dict(headers or {})
@@ -297,20 +353,16 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
         method = "POST"
         body = json.dumps(data)
 
+    url = f"https://{cloud}/{api}/{api_url}"
     if debug:
-        sys.stderr.write(f">>> {method} https://{cloud}/{api}/{api_url}\n")
+        sys.stderr.write(f">>> {method} {url}\n")
         if params:
             sys.stderr.write(f">>> params: {json.dumps(params)}\n")
         if body:
             sys.stderr.write(f">>> body: {body}\n")
 
-    try:
-        resp = requests.request(
-            method, f"https://{cloud}/{api}/{api_url}",
-            headers=headers, params=params, data=body, timeout=30,
-        )
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error calling {api_url}: {e}") from e
+    resp = _paced_request(method, url, headers=headers, params=params,
+                            data=body, debug=debug)
 
     try:
         payload = resp.json()
@@ -402,18 +454,14 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
         headers["Content-Type"] = "application/json"
         body = json.dumps(json_body)
 
+    url = f"https://{cloud}/neocloud/{path}"
     if debug:
-        sys.stderr.write(f">>> {method} https://{cloud}/neocloud/{path}\n")
+        sys.stderr.write(f">>> {method} {url}\n")
         if body:
             sys.stderr.write(f">>> body: {body}\n")
 
-    try:
-        resp = requests.request(
-            method, f"https://{cloud}/neocloud/{path}",
-            headers=headers, params=params, data=body, timeout=30,
-        )
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error calling neocloud/{path}: {e}") from e
+    resp = _paced_request(method, url, headers=headers, params=params,
+                            data=body, debug=debug)
 
     try:
         result = resp.json()
@@ -440,13 +488,11 @@ def neocloud_lookup_rev(cloud, session_id, neocloud_id, debug=False):
     None if the id doesn't exist there (404) -- a real, expected outcome
     for ids that never actually reached /neocloud/ at all."""
     headers = {"Cookie": f"SyncGatewaySession={session_id}"}
+    url = f"https://{cloud}/neocloud/{neocloud_id}"
     if debug:
-        sys.stderr.write(f">>> GET https://{cloud}/neocloud/{neocloud_id}\n")
-    try:
-        resp = requests.get(f"https://{cloud}/neocloud/{neocloud_id}",
-                             headers=headers, timeout=30)
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error looking up neocloud/{neocloud_id}: {e}") from e
+        sys.stderr.write(f">>> GET {url}\n")
+
+    resp = _paced_request("GET", url, headers=headers, debug=debug)
 
     if resp.status_code == 404:
         if debug:
@@ -490,36 +536,29 @@ def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
 
 
-def do_delete(cloud, token, ids, state, debug=False):
-    """Delete each id. do_send writes two /neocloud/ docs per file: its own
-    manual, independent document (tracked in state under the api1 id), plus
-    whatever saveAndPush creates server-side via cbMsg (whose id equals the
-    api1 id) -- so both are attempted for every id: the tracked one via
-    state, and the cbMsg one via discovery (looking up the api1 id directly
-    as a neocloud id). An id counts as untracked only if neither path finds
-    anything to delete."""
-    truly_untracked = []
-    session_id = None
-    for _id in ids:
-        found_any = False
+def do_delete_one(cloud, token, _id, state, debug=False):
+    """Delete a single id's neocloud doc(s). do_send writes two /neocloud/
+    docs per file: its own manual, independent document (tracked in state
+    under the api1 id), plus whatever saveAndPush creates server-side via
+    cbMsg (whose id equals the api1 id) -- so both are attempted: the
+    tracked one via state, and the cbMsg one via discovery (looking up the
+    id directly as a neocloud id). Returns True if either path found and
+    tombstoned something, False if truly untracked (nothing to delete
+    beyond the legacy account-listing call)."""
+    found_any = False
 
-        entry = state.get(_id)
-        if entry:
-            neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
-            found_any = True
+    entry = state.get(_id)
+    if entry:
+        neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
+        found_any = True
 
-        if session_id is None:
-            session_id = get_neocloud_cookie(cloud, token, debug=debug)
-        rev = neocloud_lookup_rev(cloud, session_id, _id, debug=debug)
-        if rev:
-            neocloud_delete_doc(cloud, token, _id, rev, debug=debug)
-            found_any = True
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    rev = neocloud_lookup_rev(cloud, session_id, _id, debug=debug)
+    if rev:
+        neocloud_delete_doc(cloud, token, _id, rev, debug=debug)
+        found_any = True
 
-        if not found_any:
-            truly_untracked.append(_id)
-
-    api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
-    return truly_untracked
+    return found_any
 
 
 def neocloud_create_doc(cloud, session_id, uid, basename, resource_type,
@@ -711,37 +750,11 @@ def with_reauth(action, config, config_path, debug=False):
 # Command handlers
 # ---------------------------------------------------------------------------
 
-def _send_with_retries(do_it, basename, attempts=SEND_RETRY_ATTEMPTS,
-                         base_delay=SEND_RETRY_BASE_DELAY):
-    """Retry a few times with backoff before giving up. Every failure seen
-    in practice sending real batches (502/504 from nginx, read timeouts)
-    has been transient backend flakiness under back-to-back requests, not
-    a real problem with any individual request -- so it's worth a few
-    automatic retries rather than immediately marking the file as failed."""
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return do_it()
-        except (BooxAPIError, BooxAuthError) as e:
-            last_err = e
-            if attempt < attempts:
-                delay = base_delay * attempt
-                sys.stderr.write(
-                    f"my-boox: {basename} failed (attempt {attempt}/{attempts}): "
-                    f"{e}\nmy-boox: retrying in {delay:.0f}s...\n"
-                )
-                time.sleep(delay)
-    raise last_err
-
-
 def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     state = load_state(config_path)
     failures = []
 
-    pacing = _config_float(config, "send_pacing_seconds", SEND_BATCH_PACING)
-    retry_attempts = _config_int(config, "send_retry_attempts", SEND_RETRY_ATTEMPTS)
-    retry_delay = _config_float(config, "send_retry_delay_seconds", SEND_RETRY_BASE_DELAY)
     check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
 
     existing = set()
@@ -756,9 +769,7 @@ def cmd_send(config, config_path, filenames, debug=False):
             if name is not None and size is not None:
                 existing.add((name, size))
 
-    multi = len(filenames) > 1
-
-    for i, raw_filename in enumerate(filenames):
+    for raw_filename in filenames:
         filename = os.path.abspath(os.path.expanduser(raw_filename))
         if not os.path.isfile(filename):
             sys.stderr.write(f"my-boox: file not found: {filename}\n")
@@ -774,14 +785,10 @@ def cmd_send(config, config_path, filenames, debug=False):
         def action(token, filename=filename):
             return do_send(cloud, token, filename, debug=debug)
 
-        def do_it():
-            return with_reauth(action, config, config_path, debug=debug)
-
         try:
-            result = _send_with_retries(do_it, basename, attempts=retry_attempts,
-                                          base_delay=retry_delay)
+            result = with_reauth(action, config, config_path, debug=debug)
         except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: failed to send {basename} after retries: {e}\n")
+            sys.stderr.write(f"my-boox: failed to send {basename}: {e}\n")
             failures.append(raw_filename)
             continue
 
@@ -795,10 +802,6 @@ def cmd_send(config, config_path, filenames, debug=False):
                 state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
                 save_state(config_path, state)
 
-        # pace requests in a multi-file batch -- back-to-back requests
-        # appear to trigger more 502/504s from Onyx's backend
-        if multi and i < len(filenames) - 1:
-            time.sleep(pacing)
 
     if failures:
         die(
@@ -821,16 +824,42 @@ def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     state = load_state(config_path)
 
-    def action(token):
-        return do_delete(cloud, token, ids, state, debug=debug)
-
-    untracked = with_reauth(action, config, config_path, debug=debug)
+    succeeded = []
+    untracked = []
+    failures = []
 
     for _id in ids:
-        state.pop(_id, None)
-    save_state(config_path, state)
+        def action(token, _id=_id):
+            return do_delete_one(cloud, token, _id, state, debug=debug)
 
-    print("deleted: " + ", ".join(ids))
+        try:
+            found = with_reauth(action, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: failed to delete {_id}: {e}\n")
+            failures.append(_id)
+            continue
+
+        state.pop(_id, None)
+        save_state(config_path, state)
+
+        if found:
+            print(f"deleted: {_id}")
+            succeeded.append(_id)
+        else:
+            print(f"deleted: {_id} (untracked -- legacy call only, may still be on device)")
+            untracked.append(_id)
+
+    attempted = succeeded + untracked
+    if attempted:
+        def batch_action(token):
+            return api_call(cloud, token, "push/message/batchDelete",
+                             data={"ids": attempted}, debug=debug)
+
+        try:
+            with_reauth(batch_action, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: legacy account-listing delete call failed: {e}\n")
+
     if untracked:
         print(
             "note: no tracked neocloud revision for " + ", ".join(untracked) +
@@ -841,6 +870,13 @@ def cmd_del(config, config_path, ids, debug=False):
         )
     print("(run 'my-boox ls' separately to confirm -- the list can lag "
           "briefly right after a delete)")
+
+    if failures:
+        die(
+            f"my-boox: {len(failures)} of {len(ids)} failed to delete: " +
+            ", ".join(failures),
+            204,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -881,21 +917,27 @@ COMMANDS
                     account (checked once per batch, plus against files
                     already sent earlier in the same batch) -- no
                     duplicate uploads from re-running the same command.
-                    On a transient server error (502/504/timeout -- these
-                    happen even in the real web client), retries up to 3
-                    times with backoff before giving up on that one file.
-                    With more than one file, pauses briefly between each
-                    to avoid triggering more of those errors in the first
-                    place. If a file still fails after retries, the rest
-                    of the batch is still attempted; failures are
+                    If a file still fails after retries (see below), the
+                    rest of the batch is still attempted; failures are
                     summarized at the end and the exit code is nonzero.
 
   ls, list         List files currently on your BOOXDrop account, with their
                     ID, size, and name. Use the ID with 'del'.
 
   del ID [ID...]   Delete one or more files by ID (as shown by 'ls').
-                    Confirms what was deleted; run 'ls' separately
+                    Each id is deleted independently and confirmed as it
+                    happens; if one fails, the rest of the batch still
+                    goes ahead, with a summary and nonzero exit code if
+                    anything genuinely failed. Run 'ls' separately
                     afterward if you want to see the resulting list.
+
+Every request any of these three make -- to the account API and to the
+actual device-delivery layer alike -- goes through the same pacing/retry
+logic: a minimum interval between requests, and automatic retries with
+backoff on a transient server error (502/503/504, connection errors,
+timeouts -- these happen even in the real web client). Configurable via
+api_pacing_seconds/api_retry_attempts/api_retry_delay_seconds, see CONFIG
+below.
 
 All three automatically handle authentication: if the stored token is
 missing, expired, or rejected by the server, my-boox requests a fresh
@@ -925,9 +967,9 @@ CONFIG
       email =
       token =
       cloud = eur.boox.com
-      send_pacing_seconds = 1.5
-      send_retry_attempts = 3
-      send_retry_delay_seconds = 3.0
+      api_pacing_seconds = 1.5
+      api_retry_attempts = 3
+      api_retry_delay_seconds = 3.0
       duplicate_check_on_send = true
 
   email  -- the address tied to your Onyx account. Required: this is who
@@ -937,12 +979,14 @@ CONFIG
   cloud  -- your BOOXDrop server region. 'eur.boox.com' for EU accounts,
             'push.boox.com' for US/VN. Matches the server shown on the
             device's own BOOXDrop / send2boox login screen.
-  send_pacing_seconds       -- pause between files in a multi-file send.
-            Onyx's backend throws more 502/504 errors under back-to-back
-            requests; this reduces how often that happens. 0 disables it.
-  send_retry_attempts       -- how many times to retry a file after a
-            transient server error before giving up on it.
-  send_retry_delay_seconds  -- base backoff delay between retries
+  api_pacing_seconds       -- minimum interval between ANY two requests
+            this tool makes (send, ls, del alike). Onyx's backend throws
+            more 502/503/504 errors under back-to-back requests; this
+            reduces how often that happens. 0 disables it.
+  api_retry_attempts       -- how many times to retry any single request
+            after a transient server error (502/503/504, connection
+            errors, timeouts) before giving up on it.
+  api_retry_delay_seconds  -- base backoff delay between retries
             (multiplied by the attempt number, so e.g. 3.0 gives 3s, 6s).
   duplicate_check_on_send   -- true/false. When true (default), 'send'
             fetches your current file list once per batch and skips any
@@ -1064,6 +1108,11 @@ def main(argv):
 
     config_path = config_override or resolve_config_path(required=False)
     config = load_config(config_path)
+
+    global API_PACING, API_RETRY_ATTEMPTS, API_RETRY_DELAY
+    API_PACING = _config_float(config, "api_pacing_seconds", SEND_BATCH_PACING)
+    API_RETRY_ATTEMPTS = _config_int(config, "api_retry_attempts", SEND_RETRY_ATTEMPTS)
+    API_RETRY_DELAY = _config_float(config, "api_retry_delay_seconds", SEND_RETRY_BASE_DELAY)
 
     try:
         if cmd == "send":
