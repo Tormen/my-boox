@@ -211,6 +211,10 @@ CONFIG_SEARCH_PATHS = [
     os.path.join("/usr/local/etc", CONFIG_NAME),
 ]
 CONFIG_ENV_VAR = "MY_BOOX_CONFIG"
+# The browser asks for _changes with limit=1000; we asked for an unbounded
+# feed, which makes the server do more work per request -- and an
+# unboundedly slow _changes is exactly what the gateway times out on.
+CHANGES_PAGE_LIMIT = 1000
 # KNOWN_CMDS is defined above, next to the venv bootstrap that needs it.
 
 
@@ -303,7 +307,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.1"
+VERSION = "5.2"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -654,13 +658,19 @@ def _paced_request(method: str, url: str, headers: Optional[Dict[str, str]] = No
             last_err = BooxAPIError(f"HTTP {resp.status_code} from {url}")
 
         if attempt < attempts:
-            delay = _api_retry_delay * attempt
+            # The first retry goes out immediately: a 504 here means the
+            # request landed on a backend that hung, and every retry
+            # observed so far was answered in ~0.13s by another one.
+            # Backoff only starts mattering if that also fails.
+            delay = 0.0 if attempt == 1 else _api_retry_delay * (attempt - 1)
             if debug:
                 sys.stderr.write(
                     f">>> request failed (attempt {attempt}/{attempts}): "
-                    f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
+                    f"{last_err}\n>>> retrying "
+                    f"{'immediately' if delay <= 0 else f'in {delay:.0f}s'}...\n"
                 )
-            time.sleep(delay)
+            if delay > 0:
+                time.sleep(delay)
 
     if not idempotent:
         raise BooxAPIError(
@@ -888,6 +898,11 @@ def neocloud_request(cloud: str, session_id: str, method: str, path: str,
     url = f"https://{cloud}/neocloud/{path}"
     if debug:
         sys.stderr.write(f">>> {method} {url}\n")
+        # Params matter here in a way they do not for api/1: 'since' and
+        # 'limit' are what determine how much work the server takes on, so
+        # a debug log without them cannot explain a slow _changes.
+        if params:
+            sys.stderr.write(f">>> params: {_debug_json(params)}\n")
         if json_body is not None:
             sys.stderr.write(f">>> body: {_debug_json(json_body)}\n")
 
@@ -1026,7 +1041,7 @@ def neocloud_delete_many(cloud: str, session_id: str, id_to_rev: Dict[str, str],
 
 def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
                   debug: bool = False) -> Docs:
-    """Incrementally sync the local cache with /neocloud/ in ONE request.
+    """Incrementally sync the local cache with /neocloud/.
 
     `_changes` is asked for `include_docs=true`, so every changed document
     arrives with its full body (name/size/timestamps) inline. Previously
@@ -1034,6 +1049,12 @@ def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
     changed document -- at the default 1.5s pacing, a first sync over 100
     files was 100 extra round trips, several minutes of pure waiting, for
     data the same response can carry for free.
+
+    The feed is bounded with `limit`, as the browser bounds it, and paged
+    through until a short page arrives. An unbounded feed asks the server
+    for arbitrarily much work in one request, which is what the gateway
+    gives up on. Steady state is still a single request: nothing has
+    changed, so the first page is empty and short.
 
     Sync Gateway's `_bulk_get` would also batch this, but it answers as
     multipart/mixed (a browser capture of it here returned HTTP 406
@@ -1062,15 +1083,32 @@ def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
                 "channels": channel,
                 "since": cache["last_seq"],
                 "include_docs": "true",
+                "limit": CHANGES_PAGE_LIMIT,
             },
             debug=debug,
         )
 
-    result = with_fresh_session(cloud, token, fetch, debug=debug)
+    while True:
+        result = with_fresh_session(cloud, token, fetch, debug=debug)
+        results = result.get("results", [])
+        _apply_changes(cloud, cache, results, token, debug=debug)
+        cache["last_seq"] = result.get("last_seq", cache["last_seq"])
+        # A short page means we have caught up. A full one means there is
+        # more, and the next request resumes from the sequence just stored.
+        if len(results) < CHANGES_PAGE_LIMIT:
+            break
+
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
     store_session_in_cache(cache, cloud, token, uid, session_id)
+    save_cache(cache_path, cache)
+    return cache["docs"]
 
-    for r in result.get("results", []):
+
+def _apply_changes(cloud: str, cache: Cache, results: Sequence[Dict[str, Any]],
+                   token: Optional[str], debug: bool = False) -> None:
+    """Fold one page of _changes into the cache."""
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    for r in results:
         doc_id = r.get("id")
         if not doc_id:
             continue
@@ -1097,10 +1135,6 @@ def refresh_cache(cloud: str, token: Optional[str], cache_path: str,
             "createdAt": doc.get("createdAt"),
             "updatedAt": doc.get("updatedAt"),
         }
-
-    cache["last_seq"] = result.get("last_seq", cache["last_seq"])
-    save_cache(cache_path, cache)
-    return cache["docs"]
 
 
 def _content_doc(doc_id: str, rev_str: str, revisions: Dict[str, Any], uid: str,
@@ -2864,6 +2898,82 @@ class TestRegressions(unittest.TestCase):
             resp = _paced_request("GET", "https://example.invalid/x")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(stub.calls), 2)
+
+    # -- an unbounded _changes asks the server for arbitrarily much work in
+    #    one request, which is what the gateway hangs on. The browser sends
+    #    limit=1000; matching it means paging.
+    def test_changes_is_bounded_and_paged_until_a_short_page(self) -> None:
+        module = sys.modules[__name__]
+        pages: List[Any] = []
+        seen_params: List[Dict[str, Any]] = []
+        limit = CHANGES_PAGE_LIMIT
+
+        def full_page(start: int, seq: int) -> Dict[str, Any]:
+            return {"last_seq": str(seq), "results": [
+                {"id": f"doc{start + i}", "changes": [{"rev": "1-a"}],
+                 "doc": {"_rev": "1-a", "name": f"f{start + i}.pdf", "size": 1}}
+                for i in range(limit)]}
+
+        pages.append(full_page(0, 1000))          # full -> keep going
+        pages.append({"last_seq": "1500", "results": [   # short -> stop
+            {"id": "tail", "changes": [{"rev": "1-t"}],
+             "doc": {"_rev": "1-t", "name": "tail.pdf", "size": 9}}]})
+
+        def fake_neocloud(cloud: Any, session_id: Any, method: Any, path: Any,
+                          params: Any = None, **k: Any) -> Any:
+            seen_params.append(dict(params or {}))
+            return pages.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
+                docs = refresh_cache("example.invalid", "tok", cache_path)
+            # read back before the temp dir goes away
+            persisted = load_cache(cache_path)["last_seq"]
+
+        self.assertEqual(len(docs), limit + 1)
+        self.assertIn("tail", docs)
+        self.assertEqual(len(seen_params), 2)                 # exactly two pages
+        self.assertEqual(seen_params[0]["limit"], limit)
+        self.assertEqual(seen_params[0]["since"], "0")
+        # the second page resumes from where the first ended
+        self.assertEqual(seen_params[1]["since"], "1000")
+        self.assertEqual(persisted, "1500")
+
+    def test_steady_state_is_still_a_single_request(self) -> None:
+        module = sys.modules[__name__]
+        calls: List[Any] = []
+
+        def fake_neocloud(cloud: Any, session_id: Any, method: Any, path: Any,
+                          params: Any = None, **k: Any) -> Any:
+            calls.append(path)
+            return {"last_seq": "42", "results": []}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
+                refresh_cache("example.invalid", "tok", cache_path)
+        self.assertEqual(calls, ["_changes"])
+
+    # -- every retry observed against the real gateway answered in ~0.13s,
+    #    so sleeping 3s before the first one was pure waiting.
+    def test_first_retry_is_immediate_then_backs_off(self) -> None:
+        module = sys.modules[__name__]
+        slept: List[float] = []
+        stub = _FakeRequests([_FakeResponse(504, {}), _FakeResponse(504, {}),
+                              _FakeResponse(200, {"result_code": 0})])
+        with mock.patch.object(module, "_api_pacing", 0), \
+             mock.patch.object(module, "_api_retry_delay", 3.0), \
+             mock.patch.object(module, "_api_retry_attempts", 3), \
+             mock.patch.object(module, "requests", stub), \
+             mock.patch.object(module.time, "sleep", lambda s: slept.append(s)):
+            resp = _paced_request("GET", "https://example.invalid/x")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(slept, [3.0])   # nothing before retry 1; 3s before retry 2
 
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
