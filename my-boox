@@ -22,11 +22,10 @@ version. Run the one-time cleanup script (see README) before switching.
     retries the action once
   - a central pacing/retry layer every outgoing request goes through
   - `send` writes its own /neocloud/ document (confirmed necessary for real
-    delivery), then a repush-style revision bump on that SAME document,
-    mimicking the real web UI's own "repush" button -- safe to do because
-    it's bumping a document this tool fully controls end to end, unlike an
-    earlier abandoned attempt to bump saveAndPush's separate, asynchronous
-    document (which raced and failed)
+    delivery) and calls api/1/push/saveAndPush (also confirmed necessary --
+    a version that substituted a repush-style bump instead delivered 0 of
+    14 files, even after a genuinely successful manual repush via the real
+    web UI, so saveAndPush stays in the flow)
   - a self-managed virtualenv under ~/.python.venv/my-boox (created and
     populated with its two dependencies -- requests, oss2 -- on first run;
     this script re-execs itself under that interpreter automatically)
@@ -139,6 +138,29 @@ api_pacing_seconds = 1.5
 api_retry_attempts = 3
 api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
+cache_path =
+
+# cache_path: where the local /neocloud/ mirror is kept. Leave blank to
+# use the default, <this config file's path>.neocloud-cache.json. Set an
+# absolute path to put it somewhere else (e.g. to share one cache across
+# multiple config files, or keep it off a synced/backed-up directory).
+#
+# The cache file itself is JSON shaped like:
+#   {
+#     "last_seq": "<opaque _changes cursor, don't edit>",
+#     "docs": {
+#       "<32-char hex neocloud document id>": {
+#         "name": "<original filename>",
+#         "size": <bytes, integer>,
+#         "rev": "<current CouchDB-style revision, e.g. '1-abcdef...'>",
+#         "createdAt": <ms epoch, may be null>,
+#         "updatedAt": <ms epoch, may be null>
+#       },
+#       ...
+#     }
+#   }
+# Delete the file (or just the "docs" object, keeping "last_seq": "0") to
+# force a full resync from scratch on the next 'ls'.
 """
 
 # Defaults for the config keys above -- also used as load_config()'s
@@ -170,7 +192,7 @@ def _config_bool(config, key, default):
         return default
 
 
-VERSION = "3.0"
+VERSION = "3.2"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -241,6 +263,7 @@ def load_config(path):
     config["default"].setdefault("api_retry_attempts", str(DEFAULT_RETRY_ATTEMPTS))
     config["default"].setdefault("api_retry_delay_seconds", str(DEFAULT_RETRY_DELAY))
     config["default"].setdefault("duplicate_check_on_send", "true")
+    config["default"].setdefault("cache_path", "")
     return config
 
 
@@ -261,12 +284,16 @@ def cache_path_for(config_path):
     return config_path + ".neocloud-cache.json"
 
 
-def load_cache(config_path):
-    path = cache_path_for(config_path)
-    if not os.path.isfile(path):
+def resolve_cache_path(config, config_path):
+    override = config["default"].get("cache_path", "").strip()
+    return override or cache_path_for(config_path)
+
+
+def load_cache(cache_path):
+    if not os.path.isfile(cache_path):
         return {"last_seq": "0", "docs": {}}
     try:
-        with open(path) as f:
+        with open(cache_path) as f:
             data = json.load(f)
         data.setdefault("last_seq", "0")
         data.setdefault("docs", {})
@@ -275,9 +302,11 @@ def load_cache(config_path):
         return {"last_seq": "0", "docs": {}}
 
 
-def save_cache(config_path, cache):
-    path = cache_path_for(config_path)
-    with open(path, "w") as f:
+def save_cache(cache_path, cache):
+    parent = os.path.dirname(cache_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(cache_path, "w") as f:
         json.dump(cache, f, indent=2)
 
 
@@ -490,15 +519,18 @@ def neocloud_get_doc(cloud, session_id, neocloud_id, debug=False):
     return result
 
 
-def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
+def neocloud_delete_doc(cloud, session_id, neocloud_id, current_rev, debug=False):
     """Submit a proper CouchDB/Sync Gateway tombstone for a document we
     know the real current revision of. The new tombstone revision becomes
-    start+1 with current_rev's hash as its parent in _revisions."""
+    start+1 with current_rev's hash as its parent in _revisions. Takes an
+    already-fetched session_id rather than a token, so callers that
+    already have one (e.g. do_delete_one, which needs one anyway to look
+    up the current rev) don't pay for a second redundant users/syncToken
+    call."""
     start, parent_hash = current_rev.split("-", 1)
     new_hash = uuid.uuid4().hex
     new_start = int(start) + 1
 
-    session_id = get_neocloud_cookie(cloud, token, debug=debug)
     doc = {
         "_deleted": True,
         "_id": neocloud_id,
@@ -509,7 +541,7 @@ def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
 
 
-def refresh_cache(cloud, token, config_path, debug=False):
+def refresh_cache(cloud, token, cache_path, debug=False):
     """Incrementally sync the local cache with /neocloud/: one cheap
     _changes call for everything since the last known cursor (id + rev +
     deleted-status for every changed document), then fetches the full body
@@ -521,7 +553,7 @@ def refresh_cache(cloud, token, config_path, debug=False):
     channel = f"{uid}-MESSAGE"
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
 
-    cache = load_cache(config_path)
+    cache = load_cache(cache_path)
     result = neocloud_request(
         cloud, session_id, "GET", "_changes",
         params={
@@ -556,7 +588,7 @@ def refresh_cache(cloud, token, config_path, debug=False):
             cache["docs"].pop(doc_id, None)
 
     cache["last_seq"] = result.get("last_seq", cache["last_seq"])
-    save_cache(config_path, cache)
+    save_cache(cache_path, cache)
     return cache["docs"]
 
 
@@ -646,9 +678,9 @@ def do_send(cloud, token, filename, debug=False):
         params={"response-content-disposition": "attachment"},
     )
 
-    # 1. Our own neocloud document (confirmed necessary for real device
-    #    delivery -- saveAndPush's own server-side write alone was tried
-    #    and failed to deliver a whole batch of real files).
+    # Our own neocloud document (confirmed necessary for real device
+    # delivery -- saveAndPush's own server-side write alone was tried and
+    # failed to deliver a whole batch of real files).
     doc_id = uuid.uuid4().hex
     rev1_hash = uuid.uuid4().hex
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
@@ -663,31 +695,32 @@ def do_send(cloud, token, filename, debug=False):
             f"registered or delivered, safe to just retry 'send'"
         ) from e
 
-    # 2. Repush-style reinforcement: bump a NEW revision onto our OWN
-    #    document, mimicking the real web UI's "repush" button exactly
-    #    (confirmed from a captured HAR: _revs_diff + _bulk_docs onto the
-    #    same id, no saveAndPush call at all). Safe here specifically
-    #    because it's our own write path end to end -- unlike an earlier
-    #    abandoned attempt to bump saveAndPush's separate, asynchronous
-    #    document, which raced and failed with 504s twice in a row.
-    #    Non-fatal if it fails: the initial write already succeeded.
-    #
-    #    NOTE: as of this version, saveAndPush is no longer called at all --
-    #    full switch to /neocloud/ alone (this write + this repush). This
-    #    is UNTESTED on-device as of writing; verify real delivery on one
-    #    file before trusting a batch to it.
+    # saveAndPush -- restored. A full switch away from it (this write plus
+    # a repush-style bump instead, no saveAndPush at all) was tried and
+    # confirmed to NOT deliver to the device (a 14-file batch registered
+    # cleanly with no duplicates, but 0 showed up on-device, and a manual
+    # device sync didn't fix it). So saveAndPush is doing something
+    # load-bearing for delivery beyond what our own write achieves --
+    # likely whatever notification/trigger the real repush button relies
+    # on only works to RE-trigger delivery of something already fully
+    # registered once, not as a substitute for that first registration.
+    api_call(
+        cloud, token, "push/saveAndPush",
+        data={
+            "data": {
+                "bucket": bucket_name,
+                "name": basename,
+                "parent": None,
+                "resourceDisplayName": basename,
+                "resourceKey": remotename,
+                "resourceType": resource_type,
+                "title": basename,
+            }
+        },
+        debug=debug,
+    )
+
     final_rev = f"1-{rev1_hash}"
-    try:
-        rev2_hash = uuid.uuid4().hex
-        rev2 = f"2-{rev2_hash}"
-        neocloud_write_doc(
-            cloud, session_id, doc_id, rev2, {"start": 2, "ids": [rev2_hash, rev1_hash]},
-            uid, basename, resource_type, remotename, size, sign_url_fn, debug=debug,
-        )
-        final_rev = rev2
-    except (BooxAPIError, BooxAuthError) as e:
-        if debug:
-            sys.stderr.write(f"my-boox: repush reinforcement failed (non-fatal): {e}\n")
 
     return doc_id, final_rev, basename, size
 
@@ -749,6 +782,7 @@ def with_reauth(action, config, config_path, debug=False):
 
 def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+    cache_path = resolve_cache_path(config, config_path)
     failures = []
 
     check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
@@ -756,7 +790,7 @@ def cmd_send(config, config_path, filenames, debug=False):
     existing = set()
     if check_duplicates:
         def fetch_existing(token):
-            return refresh_cache(cloud, token, config_path, debug=debug)
+            return refresh_cache(cloud, token, cache_path, debug=debug)
 
         try:
             docs = with_reauth(fetch_existing, config, config_path, debug=debug) or {}
@@ -797,12 +831,12 @@ def cmd_send(config, config_path, filenames, debug=False):
 
         if result:
             doc_id, rev, name, doc_size = result
-            cache = load_cache(config_path)
+            cache = load_cache(cache_path)
             cache["docs"][doc_id] = {
                 "name": name, "size": doc_size, "rev": rev,
                 "createdAt": None, "updatedAt": None,
             }
-            save_cache(config_path, cache)
+            save_cache(cache_path, cache)
 
     if failures:
         die(
@@ -814,9 +848,10 @@ def cmd_send(config, config_path, filenames, debug=False):
 
 def cmd_ls(config, config_path, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+    cache_path = resolve_cache_path(config, config_path)
 
     def action(token):
-        return refresh_cache(cloud, token, config_path, debug=debug)
+        return refresh_cache(cloud, token, cache_path, debug=debug)
 
     docs = with_reauth(action, config, config_path, debug=debug) or {}
 
@@ -853,12 +888,13 @@ def do_delete_one(cloud, token, doc_id, debug=False):
     doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
     if not doc:
         return False
-    neocloud_delete_doc(cloud, token, doc_id, doc["_rev"], debug=debug)
+    neocloud_delete_doc(cloud, session_id, doc_id, doc["_rev"], debug=debug)
     return True
 
 
 def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
+    cache_path = resolve_cache_path(config, config_path)
 
     succeeded = []
     untracked = []
@@ -875,9 +911,9 @@ def cmd_del(config, config_path, ids, debug=False):
             failures.append(doc_id)
             continue
 
-        cache = load_cache(config_path)
+        cache = load_cache(cache_path)
         cache["docs"].pop(doc_id, None)
-        save_cache(config_path, cache)
+        save_cache(cache_path, cache)
 
         if found:
             print(f"deleted: {doc_id}")
@@ -939,13 +975,13 @@ COMMANDS
   send FILE [FILE...]
                     Upload one or more files. Each write is: (1) our own
                     /neocloud/ document -- confirmed necessary for real
-                    device delivery, (2) a repush-style revision bump on
-                    that same document, mimicking the real web UI's own
-                    repush button. api/1/push/saveAndPush is no longer
-                    called at all -- full switch to /neocloud/ alone
-                    (this is new and less battle-tested than the rest of
-                    this tool; verify on-device delivery before trusting
-                    a large batch to it).
+                    device delivery, (2) api/1/push/saveAndPush --
+                    confirmed ALSO necessary: a version that dropped this
+                    in favor of a repush-style bump on our own document
+                    registered cleanly (no duplicates, no errors) but
+                    delivered 0 of 14 files to the actual device, even
+                    after a genuinely successful manual repush via the
+                    real web UI. So saveAndPush stays.
                     Skips any file whose name AND size already match
                     something already present (checked once per batch,
                     plus against files sent earlier in the same batch).
@@ -1018,6 +1054,10 @@ CONFIG
   duplicate_check_on_send   -- true/false. When true (default), 'send'
             skips any file whose name AND size already match something
             already present. Set false to always upload regardless.
+  cache_path  -- where the local /neocloud/ mirror is kept. Blank (default)
+            uses '<this config file's path>.neocloud-cache.json'. Set an
+            absolute path to use somewhere else. See LOCAL CACHE below for
+            the file's structure.
 
   SEARCH ORDER (first match wins, no merging across locations):
       1. /LINKS/default/my-boox.ini
@@ -1032,11 +1072,15 @@ CONFIG
   entirely for that single run.
 
 LOCAL CACHE
-  '<config path>.neocloud-cache.json' mirrors /neocloud/'s contents (id,
-  name, size, rev, timestamps), refreshed incrementally on every 'ls' via
-  one cheap _changes call plus a body fetch only for new/changed documents.
-  This is what 'ls' and 'del' actually read/act on -- delete this file to
-  force a full resync from scratch.
+  By default, '<config path>.neocloud-cache.json' mirrors /neocloud/'s
+  contents (id, name, size, rev, timestamps), refreshed incrementally on
+  every 'ls' via one cheap _changes call plus a body fetch only for
+  new/changed documents. This is what 'ls' and 'del' actually read/act on.
+  Set 'cache_path' in the config to use a different location instead (e.g.
+  to share one cache across configs, or keep it off a synced directory).
+  Delete the cache file (or empty its "docs" object) to force a full
+  resync from scratch. See the comments in 'my-boox --create-config' for
+  the cache file's exact JSON structure.
 
 SELF-MANAGED VIRTUALENV
   my-boox has two dependencies (requests, oss2) and manages its own

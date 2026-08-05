@@ -44,37 +44,46 @@ Notable fixes and discoveries along the way:
 - **Automatic re-authentication.** On an auth failure, it requests a fresh
   verification code, prompts you for it, obtains a new token, saves it, and
   retries the action once.
-- **Real device delivery requires a direct `/neocloud/` write.** Calling
-  only `api/1/push/saveAndPush` (what the upstream project did) registers a
-  file in the account but doesn't reliably deliver it — confirmed by a
-  batch of 14 real files where none arrived on the device using that path
-  alone. `send` writes its own `/neocloud/` document directly.
-- **A repush-style reinforcement.** After the initial write, `send` bumps a
-  second revision onto that same document, mimicking exactly what the real
-  BOOXDrop web UI's own "repush" button does (confirmed from a captured
-  HAR — no `saveAndPush` call involved in a real repush at all, just a
-  revision bump). Safe to do here because it's bumping a document this
-  tool fully controls end to end — unlike an earlier abandoned attempt to
-  bump `saveAndPush`'s own separate, asynchronous document, which raced
-  against its own backend replication and failed with `504`s twice.
+- **Both a direct `/neocloud/` write AND `saveAndPush` are required for
+  real device delivery** — neither alone is enough, confirmed by two
+  separate failed experiments:
+  - `saveAndPush` alone (what the upstream project did): registers a file
+    in the account but doesn't deliver it — confirmed by a batch of 14
+    real files where none arrived on the device using that path alone.
+  - The `/neocloud/` write alone, reinforced with a repush-style revision
+    bump (mimicking the real web UI's own "repush" button, confirmed from
+    a captured HAR to be just `_revs_diff` + `_bulk_docs` with no
+    `saveAndPush` call involved) instead of calling `saveAndPush`: also
+    registered cleanly with zero errors, but delivered 0 of 14 files. To
+    rule out flakiness as the cause, a **manual** repush click in the real
+    browser was also tested directly against files `send` had created —
+    it completed successfully server-side (confirmed by the response), and
+    still didn't deliver. So repush can only re-trigger delivery of
+    something already fully registered via `saveAndPush` at least once —
+    it's not a substitute for that first registration.
+
+  `send` therefore does both: its own `/neocloud/` write, then
+  `saveAndPush`. No repush step.
 - **A central pacing/retry layer.** Every outgoing request — across `send`,
   `ls`, and `del` alike — goes through one function that paces requests and
   retries transient failures (`502`/`503`/`504`, connection errors,
   timeouts — these happen even in the real web client) with backoff,
   configurable via `api_pacing_seconds`/`api_retry_attempts`/
   `api_retry_delay_seconds`.
-- **`/neocloud/` as the sole source of truth (v3.0).** Cross-checking
-  against Onyx's legacy `push/message` listing repeatedly surfaced
-  divergence — entries that were actually already deleted, and at least
-  one file whose legacy id didn't match its real `/neocloud/` document id
-  at all. Rather than keep patching around that with fallback
+- **`/neocloud/` as the sole source of truth for `ls`/`del` (v3.0).**
+  Cross-checking against Onyx's legacy `push/message` listing repeatedly
+  surfaced divergence — entries that were actually already deleted, and at
+  least one file whose legacy id didn't match its real `/neocloud/`
+  document id at all. Rather than keep patching around that with fallback
   reconciliation logic, v3.0 reads and writes `/neocloud/` directly via a
-  local incremental cache, so there's nothing left to diverge from.
-- **`saveAndPush` fully dropped from `send`.** Once `ls`/`del` no longer
-  read its listing at all, there was nothing left keeping it in the flow
-  besides caution — `send` now does the `/neocloud/` write and repush bump
-  only. This is newer and less battle-tested than the rest of this tool;
-  verify real on-device delivery before trusting a large batch to it.
+  local incremental cache for listing and deletion, so there's nothing
+  left to diverge from. `send` still also calls `saveAndPush`, per above —
+  that one, unlike the listing, is genuinely load-bearing.
+- **One fewer request per `del`.** `del` used to fetch a `/neocloud/`
+  session twice per file — once to check the current revision, again
+  (redundantly) inside the tombstone submission itself. The second is now
+  the same already-fetched session, saving a request (and its pacing
+  delay) on every single delete.
 
 ## Install
 
@@ -125,6 +134,7 @@ api_pacing_seconds = 1.5
 api_retry_attempts = 3
 api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
+cache_path =
 ```
 
 Fill in `email` with the address tied to your Onyx account. Leave `token`
@@ -145,6 +155,11 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 - `duplicate_check_on_send` — `true`/`false`. When `true` (default),
   `send` skips any file whose name and size already match something on
   your account. Set `false` to always upload regardless.
+- `cache_path` — where the local `/neocloud/` mirror is kept. Blank
+  (default) uses `<this config file's path>.neocloud-cache.json`. Set an
+  absolute path to use somewhere else — e.g. to share one cache across
+  multiple config files, or keep it off a synced/backed-up directory. See
+  [Local cache](#local-cache) below for the file's structure.
 
 ### Config file search order
 
@@ -169,16 +184,37 @@ my-boox --config /path/to/other.ini ls
 
 ## Local cache
 
-`<config path>.neocloud-cache.json` mirrors `/neocloud/`'s contents (id,
-name, size, revision, timestamps). `ls` refreshes it incrementally on
-every call — one cheap `_changes` request covering everything since the
-last known cursor, then a body fetch only for genuinely new or changed
-documents. The first `ls` after a clean slate pays the cost of fetching
-every file's body once; every call after that is cheap. Delete this file
-to force a full resync from scratch.
+By default, `<config path>.neocloud-cache.json` mirrors `/neocloud/`'s
+contents. `ls` refreshes it incrementally on every call — one cheap
+`_changes` request covering everything since the last known cursor, then a
+body fetch only for genuinely new or changed documents. The first `ls`
+after a clean slate pays the cost of fetching every file's body once;
+every call after that is cheap. Set `cache_path` in the config to use a
+different location. Delete the cache file (or empty its `"docs"` object,
+keeping `"last_seq": "0"`) to force a full resync from scratch.
 
 `del` and `send` both update the cache directly rather than waiting for
 the next `ls`, so it stays accurate across a session.
+
+The file itself is JSON shaped like:
+
+```json
+{
+  "last_seq": "<opaque _changes cursor, don't edit>",
+  "docs": {
+    "<32-char hex neocloud document id>": {
+      "name": "<original filename>",
+      "size": 123456,
+      "rev": "<current CouchDB-style revision, e.g. '1-abcdef...'>",
+      "createdAt": 1785761145930,
+      "updatedAt": 1785761145930
+    }
+  }
+}
+```
+
+`createdAt`/`updatedAt` are millisecond epoch timestamps and may be `null`
+for entries the cache hasn't fully synced yet.
 
 ## Use
 
@@ -217,7 +253,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v3.0**.
+Current release: **v3.2**.
 
 ## Exit codes
 
