@@ -2,19 +2,31 @@
 """
 my-boox -- send, list, and delete files on an Onyx BOOX device via BOOXDrop.
 
-Self-contained single-file CLI. Merges the functionality originally spread
-across hrw/onyx-send2boox's boox.py, send_file.py, obtain_token.py,
-request_verification_code.py, and delete_files.py
-(https://github.com/hrw/onyx-send2boox, MIT licensed, (c) 2022 Marcin
-Juszkiewicz) into one file, with:
+Self-contained single-file CLI. v3.0 is a deliberate breaking rewrite: it
+drops all reliance on Onyx's legacy `api/1/push/message` listing (which is
+not reliably kept in sync with real device state -- confirmed repeatedly to
+keep showing files long after they were actually deleted, and to sometimes
+use a completely different id than the file's real /neocloud/ document) in
+favor of /neocloud/ (a Couchbase Sync Gateway instance, confirmed to be
+what actually drives device delivery) as the sole source of truth, backed
+by a small local incremental cache so `ls` stays cheap after the first run.
+
+No backwards compatibility with the v2.x state-tracking file or ids sourced
+from `push/message` -- ids from an old `ls` output will not work with this
+version. Run the one-time cleanup script (see README) before switching.
 
   - proper auth-failure detection (checks HTTP status / result_code instead
     of assuming any 'data' key shape means success or failure)
   - automatic re-authentication: on an auth failure, requests a fresh
     verification code, prompts for it, obtains a new token, saves it, and
     retries the action once
-  - a Name-column separator sized to the longest actual filename instead of
-    a fixed-width line
+  - a central pacing/retry layer every outgoing request goes through
+  - `send` writes its own /neocloud/ document (confirmed necessary for real
+    delivery), then a repush-style revision bump on that SAME document,
+    mimicking the real web UI's own "repush" button -- safe to do because
+    it's bumping a document this tool fully controls end to end, unlike an
+    earlier abandoned attempt to bump saveAndPush's separate, asynchronous
+    document (which raced and failed)
   - a self-managed virtualenv under ~/.python.venv/my-boox (created and
     populated with its two dependencies -- requests, oss2 -- on first run;
     this script re-execs itself under that interpreter automatically)
@@ -123,18 +135,18 @@ CONFIG_TEMPLATE = """[default]
 email =
 token =
 cloud = eur.boox.com
-send_pacing_seconds = 1.5
-send_retry_attempts = 3
-send_retry_delay_seconds = 3.0
+api_pacing_seconds = 1.5
+api_retry_attempts = 3
+api_retry_delay_seconds = 3.0
 duplicate_check_on_send = true
 """
 
 # Defaults for the config keys above -- also used as load_config()'s
 # fallback values, so the template and the actual defaults can't drift
 # apart.
-SEND_BATCH_PACING = 1.5      # seconds between files in a multi-file send
-SEND_RETRY_ATTEMPTS = 3
-SEND_RETRY_BASE_DELAY = 3.0  # seconds; multiplied by attempt number
+DEFAULT_PACING = 1.5      # seconds between requests
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY = 3.0  # seconds; multiplied by attempt number
 
 
 def _config_float(config, key, default):
@@ -157,15 +169,8 @@ def _config_bool(config, key, default):
     except ValueError:
         return default
 
-# Phantom entries that push/message lists forever but which have no real
-# neocloud registration (no cbMsg field) and can't actually be removed --
-# batchDelete reports success but never clears them. Add an id here to
-# hide it from `ls`. Too rare to warrant a config option or command.
-IGNORED_IDS = {
-    "6a6e0015ca025b6e4826146f",  # 00.KEY...pdf, pre-fix fossil, no cbMsg
-}
 
-VERSION = "2.1"
+VERSION = "3.0"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -232,9 +237,9 @@ def load_config(path):
     config["default"].setdefault("email", "")
     config["default"].setdefault("token", "")
     config["default"].setdefault("cloud", DEFAULT_CLOUD)
-    config["default"].setdefault("send_pacing_seconds", str(SEND_BATCH_PACING))
-    config["default"].setdefault("send_retry_attempts", str(SEND_RETRY_ATTEMPTS))
-    config["default"].setdefault("send_retry_delay_seconds", str(SEND_RETRY_BASE_DELAY))
+    config["default"].setdefault("api_pacing_seconds", str(DEFAULT_PACING))
+    config["default"].setdefault("api_retry_attempts", str(DEFAULT_RETRY_ATTEMPTS))
+    config["default"].setdefault("api_retry_delay_seconds", str(DEFAULT_RETRY_DELAY))
     config["default"].setdefault("duplicate_check_on_send", "true")
     return config
 
@@ -247,28 +252,33 @@ def save_config(path, config):
         config.write(f)
 
 
-def state_path_for(config_path):
-    return config_path + ".neocloud-state.json"
+# ---------------------------------------------------------------------------
+# Local cache of /neocloud/ contents -- the sole source of truth for `ls`
+# and `del`. Keyed by the real neocloud document id.
+# ---------------------------------------------------------------------------
+
+def cache_path_for(config_path):
+    return config_path + ".neocloud-cache.json"
 
 
-def load_state(config_path):
-    """Maps api1_id -> {"neocloud_id": ..., "rev": ...} for files this tool
-    itself sent, so 'del' can submit a real tombstone instead of only the
-    legacy (likely non-functional) api/1 batchDelete call."""
-    path = state_path_for(config_path)
+def load_cache(config_path):
+    path = cache_path_for(config_path)
     if not os.path.isfile(path):
-        return {}
+        return {"last_seq": "0", "docs": {}}
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        data.setdefault("last_seq", "0")
+        data.setdefault("docs", {})
+        return data
     except (ValueError, OSError):
-        return {}
+        return {"last_seq": "0", "docs": {}}
 
 
-def save_state(config_path, state):
-    path = state_path_for(config_path)
+def save_cache(config_path, cache):
+    path = cache_path_for(config_path)
     with open(path, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(cache, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +294,61 @@ def _get(d, *keys):
     return cur
 
 
+# Populated once in main() from config (api_pacing_seconds/api_retry_attempts/
+# api_retry_delay_seconds); these module-level defaults are the fallback for
+# any code path that runs before that (there isn't one currently, but keeps
+# _paced_request() safe to call regardless of init order).
+API_PACING = DEFAULT_PACING
+API_RETRY_ATTEMPTS = DEFAULT_RETRY_ATTEMPTS
+API_RETRY_DELAY = DEFAULT_RETRY_DELAY
+
+_LAST_REQUEST_TIME = 0.0
+
+
+def _paced_request(method, url, headers=None, params=None, data=None,
+                     timeout=30, debug=False):
+    """Single choke point for every outgoing HTTP request this tool makes --
+    both api/1/* (Bearer-authenticated) and /neocloud/* (cookie-
+    authenticated) calls route through here. Enforces a minimum pacing
+    interval between consecutive requests and retries transient failures
+    (connection errors, timeouts, 502/503/504) with backoff before giving
+    up. Onyx's backend throws noticeably more of these under back-to-back
+    requests -- centralizing this here fixes it for every command (send,
+    del, ls) uniformly. Non-transient responses (200, 404, 4xx, etc.) are
+    returned as-is on the first try; interpreting them is the caller's job."""
+    global _LAST_REQUEST_TIME
+    last_err = None
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        if API_PACING > 0:
+            wait = API_PACING - (time.monotonic() - _LAST_REQUEST_TIME)
+            if wait > 0:
+                time.sleep(wait)
+        _LAST_REQUEST_TIME = time.monotonic()
+
+        try:
+            resp = requests.request(method, url, headers=headers, params=params,
+                                      data=data, timeout=timeout)
+        except requests.RequestException as e:
+            last_err = e
+        else:
+            if resp.status_code not in (502, 503, 504):
+                return resp
+            last_err = BooxAPIError(f"HTTP {resp.status_code} from {url}")
+
+        if attempt < API_RETRY_ATTEMPTS:
+            delay = API_RETRY_DELAY * attempt
+            if debug:
+                sys.stderr.write(
+                    f">>> request failed (attempt {attempt}/{API_RETRY_ATTEMPTS}): "
+                    f"{last_err}\n>>> retrying in {delay:.0f}s...\n"
+                )
+            time.sleep(delay)
+
+    if isinstance(last_err, requests.RequestException):
+        raise BooxAPIError(f"network error calling {url}: {last_err}") from last_err
+    raise last_err
+
+
 def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
              params=None, api="api/1", debug=False):
     headers = dict(headers or {})
@@ -297,20 +362,16 @@ def api_call(cloud, token, api_url, method="GET", headers=None, data=None,
         method = "POST"
         body = json.dumps(data)
 
+    url = f"https://{cloud}/{api}/{api_url}"
     if debug:
-        sys.stderr.write(f">>> {method} https://{cloud}/{api}/{api_url}\n")
+        sys.stderr.write(f">>> {method} {url}\n")
         if params:
             sys.stderr.write(f">>> params: {json.dumps(params)}\n")
         if body:
             sys.stderr.write(f">>> body: {body}\n")
 
-    try:
-        resp = requests.request(
-            method, f"https://{cloud}/{api}/{api_url}",
-            headers=headers, params=params, data=body, timeout=30,
-        )
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error calling {api_url}: {e}") from e
+    resp = _paced_request(method, url, headers=headers, params=params,
+                            data=body, debug=debug)
 
     try:
         payload = resp.json()
@@ -348,48 +409,14 @@ def get_uid(cloud, token, debug=False):
     return _get(payload, "data", "uid")
 
 
-def _fetch_push_list(cloud, token, limit=100, offset=0, debug=False):
-    payload = api_call(
-        cloud, token, "push/message",
-        params={"where": "{" f'"limit": {limit}, ' f'"offset": {offset}, ' '"parent": 0}'},
-        debug=debug,
-    )
-    return payload.get("list", []) if isinstance(payload, dict) else []
-
-
-def do_list(cloud, token, limit=24, offset=0, debug=False):
-    files = _fetch_push_list(cloud, token, limit=limit, offset=offset, debug=debug)
-
-    rows = []
-    for entry in files:
-        data = entry["data"]["args"]
-        if data["_id"] in IGNORED_IDS:
-            continue
-        fmt = data["formats"][0]
-        size = int(data["storage"][fmt]["oss"]["size"])
-        rows.append((data["_id"], size, data["name"]))
-
-    # I would expect LC_ALL to be set but it may not be (kept from upstream,
-    # affects the ':>10n' locale-aware digit grouping below)
-    locale.setlocale(locale.LC_ALL, locale.getlocale()[0])
-
-    name_width = max([len(r[2]) for r in rows] + [len("Name")])
-    print("        ID               |    Size    | Name")
-    print("-------------------------|------------|" + "-" * name_width)
-    for _id, size, name in rows:
-        print(f"{_id} | {size:>10n} | {name}")
-
-    return rows
-
-
 def get_neocloud_cookie(cloud, token, debug=False):
     """The actual device-facing storage is a Couchbase Sync Gateway instance
     at /neocloud/ (confirmed by its CouchDB-style _revs_diff/_bulk_docs/
-    _local API and a 'SyncGatewaySession' cookie), completely separate from
-    the Bearer-token-authenticated api/1/* REST layer. users/syncToken is
-    itself a normal Bearer-authenticated call that hands back the session
-    id the browser then uses as that cookie -- so no browser/login flow is
-    needed to obtain it."""
+    _changes API and a 'SyncGatewaySession' cookie), completely separate
+    from the Bearer-token-authenticated api/1/* REST layer. users/syncToken
+    is itself a normal Bearer-authenticated call that hands back the
+    session id the browser then uses as that cookie -- so no browser/login
+    flow is needed to obtain it."""
     payload = api_call(cloud, token, "users/syncToken", debug=debug)
     return _get(payload, "data", "session_id")
 
@@ -402,18 +429,14 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
         headers["Content-Type"] = "application/json"
         body = json.dumps(json_body)
 
+    url = f"https://{cloud}/neocloud/{path}"
     if debug:
-        sys.stderr.write(f">>> {method} https://{cloud}/neocloud/{path}\n")
+        sys.stderr.write(f">>> {method} {url}\n")
         if body:
             sys.stderr.write(f">>> body: {body}\n")
 
-    try:
-        resp = requests.request(
-            method, f"https://{cloud}/neocloud/{path}",
-            headers=headers, params=params, data=body, timeout=30,
-        )
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error calling neocloud/{path}: {e}") from e
+    resp = _paced_request(method, url, headers=headers, params=params,
+                            data=body, debug=debug)
 
     try:
         result = resp.json()
@@ -432,25 +455,22 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
     return result
 
 
-def neocloud_lookup_rev(cloud, session_id, neocloud_id, debug=False):
-    """GET /neocloud/<id> directly to discover its current _rev, on the
-    hypothesis that for anything created via saveAndPush, the api/1 _id and
-    the neocloud _id are the same value (confirmed true for at least one
-    case: cbMsg.id matched ls's _id exactly). Returns the _rev string, or
-    None if the id doesn't exist there (404) -- a real, expected outcome
-    for ids that never actually reached /neocloud/ at all."""
+def neocloud_get_doc(cloud, session_id, neocloud_id, debug=False):
+    """Plain GET /neocloud/<id> -- returns the full document dict (including
+    _rev, name, size, etc.) for a live document, or None if the id doesn't
+    exist there (404) -- both for ids that never existed, and for ids that
+    were already deleted (a deleted document also 404s on a plain GET,
+    indistinguishable from never having existed)."""
     headers = {"Cookie": f"SyncGatewaySession={session_id}"}
+    url = f"https://{cloud}/neocloud/{neocloud_id}"
     if debug:
-        sys.stderr.write(f">>> GET https://{cloud}/neocloud/{neocloud_id}\n")
-    try:
-        resp = requests.get(f"https://{cloud}/neocloud/{neocloud_id}",
-                             headers=headers, timeout=30)
-    except requests.RequestException as e:
-        raise BooxAPIError(f"network error looking up neocloud/{neocloud_id}: {e}") from e
+        sys.stderr.write(f">>> GET {url}\n")
+
+    resp = _paced_request("GET", url, headers=headers, debug=debug)
 
     if resp.status_code == 404:
         if debug:
-            sys.stderr.write("<<< 404 (not in neocloud)\n")
+            sys.stderr.write("<<< 404 (not found)\n")
         return None
 
     try:
@@ -467,14 +487,13 @@ def neocloud_lookup_rev(cloud, session_id, neocloud_id, debug=False):
     if resp.status_code >= 400:
         raise BooxAPIError(f"neocloud/{neocloud_id} lookup failed: HTTP {resp.status_code}: {result}")
 
-    return result.get("_rev")
+    return result
 
 
 def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
     """Submit a proper CouchDB/Sync Gateway tombstone for a document we
-    know the real current revision of. current_rev is the bare hash part
-    (no 'N-' prefix) of the revision being deleted -- the new tombstone
-    revision becomes start+1 with that hash as its parent in _revisions."""
+    know the real current revision of. The new tombstone revision becomes
+    start+1 with current_rev's hash as its parent in _revisions."""
     start, parent_hash = current_rev.split("-", 1)
     new_hash = uuid.uuid4().hex
     new_start = int(start) + 1
@@ -490,61 +509,70 @@ def neocloud_delete_doc(cloud, token, neocloud_id, current_rev, debug=False):
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
 
 
-def do_delete(cloud, token, ids, state, debug=False):
-    """Delete each id. do_send writes two /neocloud/ docs per file: its own
-    manual, independent document (tracked in state under the api1 id), plus
-    whatever saveAndPush creates server-side via cbMsg (whose id equals the
-    api1 id) -- so both are attempted for every id: the tracked one via
-    state, and the cbMsg one via discovery (looking up the api1 id directly
-    as a neocloud id). An id counts as untracked only if neither path finds
-    anything to delete."""
-    truly_untracked = []
-    session_id = None
-    for _id in ids:
-        found_any = False
+def refresh_cache(cloud, token, config_path, debug=False):
+    """Incrementally sync the local cache with /neocloud/: one cheap
+    _changes call for everything since the last known cursor (id + rev +
+    deleted-status for every changed document), then fetches the full body
+    (name/size/etc.) only for genuinely new or changed LIVE documents.
+    Cheap on every call after the first; the first run pays the cost of
+    fetching every existing file's body once. Returns the up-to-date
+    {doc_id: {"name":, "size":, "rev":, "createdAt":, "updatedAt":}} dict."""
+    uid = get_uid(cloud, token, debug=debug)
+    channel = f"{uid}-MESSAGE"
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
 
-        entry = state.get(_id)
-        if entry:
-            neocloud_delete_doc(cloud, token, entry["neocloud_id"], entry["rev"], debug=debug)
-            found_any = True
+    cache = load_cache(config_path)
+    result = neocloud_request(
+        cloud, session_id, "GET", "_changes",
+        params={
+            "style": "all_docs",
+            "filter": "sync_gateway/bychannel",
+            "channels": channel,
+            "since": cache["last_seq"],
+        },
+        debug=debug,
+    )
 
-        if session_id is None:
-            session_id = get_neocloud_cookie(cloud, token, debug=debug)
-        rev = neocloud_lookup_rev(cloud, session_id, _id, debug=debug)
-        if rev:
-            neocloud_delete_doc(cloud, token, _id, rev, debug=debug)
-            found_any = True
+    for r in result.get("results", []):
+        doc_id = r.get("id")
+        if not doc_id:
+            continue
+        if r.get("deleted"):
+            cache["docs"].pop(doc_id, None)
+            continue
+        changes = r.get("changes", [])
+        if not changes:
+            continue
+        doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
+        if doc:
+            cache["docs"][doc_id] = {
+                "name": doc.get("name"),
+                "size": doc.get("size"),
+                "rev": doc.get("_rev", changes[0]["rev"]),
+                "createdAt": doc.get("createdAt"),
+                "updatedAt": doc.get("updatedAt"),
+            }
+        else:
+            cache["docs"].pop(doc_id, None)
 
-        if not found_any:
-            truly_untracked.append(_id)
-
-    api_call(cloud, token, "push/message/batchDelete", data={"ids": ids}, debug=debug)
-    return truly_untracked
+    cache["last_seq"] = result.get("last_seq", cache["last_seq"])
+    save_cache(config_path, cache)
+    return cache["docs"]
 
 
-def neocloud_create_doc(cloud, session_id, uid, basename, resource_type,
-                          remotename, size, sign_url_fn, debug=False):
-    """Write the file's document to /neocloud/ as a brand-new, independent
-    document (own fresh id, revision 1) -- NOT a revision bump onto
-    saveAndPush's cbMsg doc. That bump approach was tried and failed twice
-    in a row with a 504 Gateway Timeout specifically on this write,
-    immediately after saveAndPush returned -- plausibly a race against
-    saveAndPush's own asynchronous backend replication, since bumping
-    depends on cbMsg's revision 1 already being fully committed server-
-    side, which this self-contained approach never depends on. Confirmed
-    reliable on-device delivery, at the cost of a second, orphaned
-    document with its own id showing as a duplicate row in the BOOXDrop
-    web UI (do_delete cleans up both)."""
-    neocloud_id = uuid.uuid4().hex
-    rev_hash = uuid.uuid4().hex
+def neocloud_write_doc(cloud, session_id, doc_id, rev_str, revisions, uid,
+                         basename, resource_type, remotename, size,
+                         sign_url_fn, debug=False):
+    """Shared low-level write used by both the initial create (rev 1) and
+    the repush-style bump (rev 2+) -- same document shape either way,
+    only _rev/_revisions differ."""
     now_ms = int(time.time() * 1000)
-
     content_obj = {
-        "_id": neocloud_id,
+        "_id": doc_id,
         "createdAt": now_ms,
         "distributeChannel": "onyx",
         "formats": [resource_type],
-        "guid": neocloud_id,
+        "guid": doc_id,
         "name": basename,
         "ownerId": uid,
         "size": size,
@@ -572,20 +600,18 @@ def neocloud_create_doc(cloud, session_id, uid, basename, resource_type,
         "user": uid,
         "name": basename,
         "size": size,
-        "uniqueId": neocloud_id,
+        "uniqueId": doc_id,
         "createdAt": now_ms,
         "updatedAt": now_ms,
-        "_id": neocloud_id,
-        "_rev": f"1-{rev_hash}",
-        "_revisions": {"start": 1, "ids": [rev_hash]},
+        "_id": doc_id,
+        "_rev": rev_str,
+        "_revisions": revisions,
     }
-
+    rev_hash = rev_str.split("-", 1)[1]
     neocloud_request(cloud, session_id, "POST", "_revs_diff",
-                      json_body={neocloud_id: [f"1-{rev_hash}"]}, debug=debug)
+                      json_body={doc_id: [rev_str]}, debug=debug)
     neocloud_request(cloud, session_id, "POST", "_bulk_docs",
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
-
-    return neocloud_id, f"1-{rev_hash}"
 
 
 def do_send(cloud, token, filename, debug=False):
@@ -615,45 +641,74 @@ def do_send(cloud, token, filename, debug=False):
     resource_type = extension.lstrip(".").lower() or "txt"
     size = os.path.getsize(filename)
 
-    # Manual neocloud write FIRST (confirmed necessary for real device
-    # delivery), THEN saveAndPush -- this ordering and independence from
-    # saveAndPush's own write is what's actually confirmed reliable.
-    session_id = get_neocloud_cookie(cloud, token, debug=debug)
     sign_url_fn = lambda key: bucket.sign_url(
         "GET", key, 3 * 3600,
         params={"response-content-disposition": "attachment"},
     )
+
+    # 1. Our own neocloud document (confirmed necessary for real device
+    #    delivery -- saveAndPush's own server-side write alone was tried
+    #    and failed to deliver a whole batch of real files).
+    doc_id = uuid.uuid4().hex
+    rev1_hash = uuid.uuid4().hex
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
     try:
-        manual_neocloud_id, manual_rev = neocloud_create_doc(
-            cloud, session_id, uid, basename, resource_type, remotename,
-            size, sign_url_fn, debug=debug,
+        neocloud_write_doc(
+            cloud, session_id, doc_id, f"1-{rev1_hash}", {"start": 1, "ids": [rev1_hash]},
+            uid, basename, resource_type, remotename, size, sign_url_fn, debug=debug,
         )
     except (BooxAPIError, BooxAuthError) as e:
         raise BooxAPIError(
-            f"neocloud delivery write failed before saveAndPush even ran: "
-            f"{e} -- nothing was registered or delivered, safe to just "
-            f"retry 'send'"
+            f"neocloud delivery write failed: {e} -- nothing was "
+            f"registered or delivered, safe to just retry 'send'"
         ) from e
 
-    result = api_call(
-        cloud, token, "push/saveAndPush",
-        data={
-            "data": {
-                "bucket": bucket_name,
-                "name": basename,
-                "parent": None,
-                "resourceDisplayName": basename,
-                "resourceKey": remotename,
-                "resourceType": resource_type,
-                "title": basename,
-            }
-        },
-        debug=debug,
-    )
+    # 2. saveAndPush -- kept even though we no longer read its listing,
+    #    since we don't have evidence it's safe to drop (an earlier
+    #    attempt to rely on ITS write alone, without our own, delivered
+    #    none of a 14-file batch).
+    try:
+        api_call(
+            cloud, token, "push/saveAndPush",
+            data={
+                "data": {
+                    "bucket": bucket_name,
+                    "name": basename,
+                    "parent": None,
+                    "resourceDisplayName": basename,
+                    "resourceKey": remotename,
+                    "resourceType": resource_type,
+                    "title": basename,
+                }
+            },
+            debug=debug,
+        )
+    except (BooxAPIError, BooxAuthError) as e:
+        if debug:
+            sys.stderr.write(f"my-boox: saveAndPush failed (non-fatal, continuing): {e}\n")
 
-    api1_id = _get(result, "data", "_id")
+    # 3. Repush-style reinforcement: bump a NEW revision onto our OWN
+    #    document, mimicking the real web UI's "repush" button exactly
+    #    (confirmed from a captured HAR: _revs_diff + _bulk_docs onto the
+    #    same id, no saveAndPush call at all). Safe here specifically
+    #    because it's our own write path end to end -- unlike an earlier
+    #    abandoned attempt to bump saveAndPush's separate, asynchronous
+    #    document, which raced and failed with 504s twice in a row.
+    #    Non-fatal if it fails: the initial write already succeeded.
+    final_rev = f"1-{rev1_hash}"
+    try:
+        rev2_hash = uuid.uuid4().hex
+        rev2 = f"2-{rev2_hash}"
+        neocloud_write_doc(
+            cloud, session_id, doc_id, rev2, {"start": 2, "ids": [rev2_hash, rev1_hash]},
+            uid, basename, resource_type, remotename, size, sign_url_fn, debug=debug,
+        )
+        final_rev = rev2
+    except (BooxAPIError, BooxAuthError) as e:
+        if debug:
+            sys.stderr.write(f"my-boox: repush reinforcement failed (non-fatal): {e}\n")
 
-    return api1_id, manual_neocloud_id, manual_rev
+    return doc_id, final_rev, basename, size
 
 
 # ---------------------------------------------------------------------------
@@ -711,54 +766,28 @@ def with_reauth(action, config, config_path, debug=False):
 # Command handlers
 # ---------------------------------------------------------------------------
 
-def _send_with_retries(do_it, basename, attempts=SEND_RETRY_ATTEMPTS,
-                         base_delay=SEND_RETRY_BASE_DELAY):
-    """Retry a few times with backoff before giving up. Every failure seen
-    in practice sending real batches (502/504 from nginx, read timeouts)
-    has been transient backend flakiness under back-to-back requests, not
-    a real problem with any individual request -- so it's worth a few
-    automatic retries rather than immediately marking the file as failed."""
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return do_it()
-        except (BooxAPIError, BooxAuthError) as e:
-            last_err = e
-            if attempt < attempts:
-                delay = base_delay * attempt
-                sys.stderr.write(
-                    f"my-boox: {basename} failed (attempt {attempt}/{attempts}): "
-                    f"{e}\nmy-boox: retrying in {delay:.0f}s...\n"
-                )
-                time.sleep(delay)
-    raise last_err
-
-
 def cmd_send(config, config_path, filenames, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
-    state = load_state(config_path)
     failures = []
 
-    pacing = _config_float(config, "send_pacing_seconds", SEND_BATCH_PACING)
-    retry_attempts = _config_int(config, "send_retry_attempts", SEND_RETRY_ATTEMPTS)
-    retry_delay = _config_float(config, "send_retry_delay_seconds", SEND_RETRY_BASE_DELAY)
     check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
 
     existing = set()
     if check_duplicates:
         def fetch_existing(token):
-            return _fetch_push_list(cloud, token, debug=debug)
+            return refresh_cache(cloud, token, config_path, debug=debug)
 
-        existing_entries = with_reauth(fetch_existing, config, config_path, debug=debug) or []
-        for entry in existing_entries:
-            args = entry.get("data", {}).get("args", {})
-            name, size = args.get("name"), args.get("size")
+        try:
+            docs = with_reauth(fetch_existing, config, config_path, debug=debug) or {}
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: duplicate check failed, continuing without it: {e}\n")
+            docs = {}
+        for meta in docs.values():
+            name, size = meta.get("name"), meta.get("size")
             if name is not None and size is not None:
                 existing.add((name, size))
 
-    multi = len(filenames) > 1
-
-    for i, raw_filename in enumerate(filenames):
+    for raw_filename in filenames:
         filename = os.path.abspath(os.path.expanduser(raw_filename))
         if not os.path.isfile(filename):
             sys.stderr.write(f"my-boox: file not found: {filename}\n")
@@ -774,14 +803,10 @@ def cmd_send(config, config_path, filenames, debug=False):
         def action(token, filename=filename):
             return do_send(cloud, token, filename, debug=debug)
 
-        def do_it():
-            return with_reauth(action, config, config_path, debug=debug)
-
         try:
-            result = _send_with_retries(do_it, basename, attempts=retry_attempts,
-                                          base_delay=retry_delay)
+            result = with_reauth(action, config, config_path, debug=debug)
         except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: failed to send {basename} after retries: {e}\n")
+            sys.stderr.write(f"my-boox: failed to send {basename}: {e}\n")
             failures.append(raw_filename)
             continue
 
@@ -790,15 +815,13 @@ def cmd_send(config, config_path, filenames, debug=False):
             existing.add((basename, size))
 
         if result:
-            api1_id, neocloud_id, neocloud_rev = result
-            if api1_id and neocloud_id and neocloud_rev:
-                state[api1_id] = {"neocloud_id": neocloud_id, "rev": neocloud_rev}
-                save_state(config_path, state)
-
-        # pace requests in a multi-file batch -- back-to-back requests
-        # appear to trigger more 502/504s from Onyx's backend
-        if multi and i < len(filenames) - 1:
-            time.sleep(pacing)
+            doc_id, rev, name, doc_size = result
+            cache = load_cache(config_path)
+            cache["docs"][doc_id] = {
+                "name": name, "size": doc_size, "rev": rev,
+                "createdAt": None, "updatedAt": None,
+            }
+            save_cache(config_path, cache)
 
     if failures:
         die(
@@ -812,35 +835,90 @@ def cmd_ls(config, config_path, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
 
     def action(token):
-        return do_list(cloud, token, debug=debug)
+        return refresh_cache(cloud, token, config_path, debug=debug)
 
-    with_reauth(action, config, config_path, debug=debug)
+    docs = with_reauth(action, config, config_path, debug=debug) or {}
+
+    rows = []
+    for doc_id, meta in docs.items():
+        name, size = meta.get("name"), meta.get("size")
+        if name is None or size is None:
+            continue
+        sort_key = meta.get("updatedAt") or meta.get("createdAt") or 0
+        rows.append((doc_id, size, name, sort_key))
+    rows.sort(key=lambda r: r[3], reverse=True)
+
+    # I would expect LC_ALL to be set but it may not be (kept from upstream,
+    # affects the ':>Nn' locale-aware digit grouping below)
+    locale.setlocale(locale.LC_ALL, locale.getlocale()[0])
+
+    id_width = max([len(r[0]) for r in rows] + [len("ID")])
+    size_width = 10
+    name_width = max([len(r[2]) for r in rows] + [len("Name")])
+
+    print(f"{'ID':<{id_width}} | {'Size':>{size_width}} | Name")
+    print("-" * id_width + "-|-" + "-" * size_width + "-|-" + "-" * name_width)
+    for doc_id, size, name, _ in rows:
+        print(f"{doc_id:<{id_width}} | {size:>{size_width}n} | {name}")
+
+    return rows
+
+
+def do_delete_one(cloud, token, doc_id, debug=False):
+    """Delete a single neocloud document directly by its real id -- ids
+    come straight from 'ls', which reads /neocloud/ natively now, so
+    there's no id-mismatch class of problem to work around any more."""
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
+    if not doc:
+        return False
+    neocloud_delete_doc(cloud, token, doc_id, doc["_rev"], debug=debug)
+    return True
 
 
 def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
-    state = load_state(config_path)
 
-    def action(token):
-        return do_delete(cloud, token, ids, state, debug=debug)
+    succeeded = []
+    untracked = []
+    failures = []
 
-    untracked = with_reauth(action, config, config_path, debug=debug)
+    for doc_id in ids:
+        def action(token, doc_id=doc_id):
+            return do_delete_one(cloud, token, doc_id, debug=debug)
 
-    for _id in ids:
-        state.pop(_id, None)
-    save_state(config_path, state)
+        try:
+            found = with_reauth(action, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: failed to delete {doc_id}: {e}\n")
+            failures.append(doc_id)
+            continue
 
-    print("deleted: " + ", ".join(ids))
+        cache = load_cache(config_path)
+        cache["docs"].pop(doc_id, None)
+        save_cache(config_path, cache)
+
+        if found:
+            print(f"deleted: {doc_id}")
+            succeeded.append(doc_id)
+        else:
+            print(f"deleted: {doc_id} (not found -- already gone, or never existed)")
+            untracked.append(doc_id)
+
     if untracked:
         print(
-            "note: no tracked neocloud revision for " + ", ".join(untracked) +
-            " (sent before this feature existed, or via the website) -- "
-            "only the legacy account-listing delete ran for these; they "
-            "may still be on the device. Use the BOOXDrop web UI's trash "
-            "icon for those."
+            "note: no live document found for " + ", ".join(untracked) +
+            " -- genuinely ambiguous between already-deleted (common if "
+            "re-running del on the same id) and never having existed."
         )
-    print("(run 'my-boox ls' separately to confirm -- the list can lag "
-          "briefly right after a delete)")
+    print("(run 'my-boox ls' to refresh the cache and confirm)")
+
+    if failures:
+        die(
+            f"my-boox: {len(failures)} of {len(ids)} failed to delete: " +
+            ", ".join(failures),
+            204,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +941,10 @@ def print_help(to=sys.stdout):
     to.write(f"""\
 my-boox -- send, list, and delete files on an Onyx BOOX device via BOOXDrop.
 
+v3.0: reads and writes /neocloud/ directly (via a local cache), with no
+reliance on the legacy push/message listing. Not compatible with ids from
+a v2.x 'ls' -- run the one-time cleanup script first if migrating.
+
 USAGE
   my-boox [-D|--debug] [--config [PATH]] send FILE [FILE...]
   my-boox [-D|--debug] [--config [PATH]] ls|list
@@ -874,28 +956,35 @@ USAGE
 
 COMMANDS
   send FILE [FILE...]
-                    Upload one or more files to your BOOXDrop account.
-                    Each shows up on the device under Storage/Push
-                    (BOOXDrop app -> Push tab). Skips any file whose name
-                    AND size already match something already on the
-                    account (checked once per batch, plus against files
-                    already sent earlier in the same batch) -- no
-                    duplicate uploads from re-running the same command.
-                    On a transient server error (502/504/timeout -- these
-                    happen even in the real web client), retries up to 3
-                    times with backoff before giving up on that one file.
-                    With more than one file, pauses briefly between each
-                    to avoid triggering more of those errors in the first
-                    place. If a file still fails after retries, the rest
-                    of the batch is still attempted; failures are
-                    summarized at the end and the exit code is nonzero.
+                    Upload one or more files. Each write is: (1) our own
+                    /neocloud/ document -- confirmed necessary for real
+                    device delivery, (2) saveAndPush -- kept as a
+                    reinforcement even though its own listing is no longer
+                    read, (3) a repush-style revision bump on our own
+                    document, mimicking the real web UI's repush button.
+                    Skips any file whose name AND size already match
+                    something already present (checked once per batch,
+                    plus against files sent earlier in the same batch).
+                    If a file still fails after retries, the rest of the
+                    batch is still attempted; failures are summarized at
+                    the end and the exit code is nonzero.
 
-  ls, list         List files currently on your BOOXDrop account, with their
-                    ID, size, and name. Use the ID with 'del'.
+  ls, list         List files, refreshing the local cache incrementally
+                    from /neocloud/ first (cheap after the first run).
+                    Use the ID shown with 'del'.
 
   del ID [ID...]   Delete one or more files by ID (as shown by 'ls').
-                    Confirms what was deleted; run 'ls' separately
-                    afterward if you want to see the resulting list.
+                    Each id is deleted independently and confirmed as it
+                    happens; if one fails, the rest of the batch still
+                    goes ahead, with a summary and nonzero exit code if
+                    anything genuinely failed.
+
+Every request any command makes goes through the same central pacing/retry
+layer: a minimum interval between requests, and automatic retries with
+backoff on a transient server error (502/503/504, connection errors,
+timeouts -- these happen even in the real web client). Configurable via
+api_pacing_seconds/api_retry_attempts/api_retry_delay_seconds, see CONFIG
+below.
 
 All three automatically handle authentication: if the stored token is
 missing, expired, or rejected by the server, my-boox requests a fresh
@@ -925,9 +1014,9 @@ CONFIG
       email =
       token =
       cloud = eur.boox.com
-      send_pacing_seconds = 1.5
-      send_retry_attempts = 3
-      send_retry_delay_seconds = 3.0
+      api_pacing_seconds = 1.5
+      api_retry_attempts = 3
+      api_retry_delay_seconds = 3.0
       duplicate_check_on_send = true
 
   email  -- the address tied to your Onyx account. Required: this is who
@@ -935,19 +1024,16 @@ CONFIG
   token  -- filled in automatically the first time you authenticate; leave
             this blank in a fresh config.
   cloud  -- your BOOXDrop server region. 'eur.boox.com' for EU accounts,
-            'push.boox.com' for US/VN. Matches the server shown on the
-            device's own BOOXDrop / send2boox login screen.
-  send_pacing_seconds       -- pause between files in a multi-file send.
-            Onyx's backend throws more 502/504 errors under back-to-back
-            requests; this reduces how often that happens. 0 disables it.
-  send_retry_attempts       -- how many times to retry a file after a
-            transient server error before giving up on it.
-  send_retry_delay_seconds  -- base backoff delay between retries
+            'push.boox.com' for US/VN.
+  api_pacing_seconds       -- minimum interval between ANY two requests
+            this tool makes. 0 disables it.
+  api_retry_attempts       -- how many times to retry any single request
+            after a transient server error before giving up on it.
+  api_retry_delay_seconds  -- base backoff delay between retries
             (multiplied by the attempt number, so e.g. 3.0 gives 3s, 6s).
   duplicate_check_on_send   -- true/false. When true (default), 'send'
-            fetches your current file list once per batch and skips any
-            file whose name AND size already match something already
-            there. Set false to always upload, even if a match exists.
+            skips any file whose name AND size already match something
+            already present. Set false to always upload regardless.
 
   SEARCH ORDER (first match wins, no merging across locations):
       1. /LINKS/default/my-boox.ini
@@ -956,23 +1042,24 @@ CONFIG
       4. /usr/local/etc/my-boox.ini
 
   Run 'my-boox --config' with no other arguments at any time to see exactly
-  which of these paths it currently resolves to (useful when you're not
-  sure which one is actually in effect, e.g. if you have both a personal
-  and a system-wide copy).
+  which of these paths it currently resolves to.
 
-  A '--config PATH' passed alongside a command (e.g.
-  'my-boox --config ~/work-boox.ini ls') overrides the search entirely for
-  that single run, without touching which file the search would otherwise
-  find.
+  A '--config PATH' passed alongside a command overrides the search
+  entirely for that single run.
+
+LOCAL CACHE
+  '<config path>.neocloud-cache.json' mirrors /neocloud/'s contents (id,
+  name, size, rev, timestamps), refreshed incrementally on every 'ls' via
+  one cheap _changes call plus a body fetch only for new/changed documents.
+  This is what 'ls' and 'del' actually read/act on -- delete this file to
+  force a full resync from scratch.
 
 SELF-MANAGED VIRTUALENV
   my-boox has two dependencies (requests, oss2) and manages its own
   virtualenv for them automatically -- nothing to pip install by hand.
-
   On first run, it creates a venv at ~/.python.venv/my-boox, installs both
-  packages into it, then re-execs itself under that interpreter. Every
-  run after the first is instant (it just checks the venv already exists).
-  Delete that directory to force a clean reinstall.
+  packages into it, then re-execs itself under that interpreter. Delete
+  that directory to force a clean reinstall.
 
 EXAMPLES
   my-boox --create-config              # see the template
@@ -981,8 +1068,8 @@ EXAMPLES
   my-boox send report.pdf
   my-boox send a.pdf b.pdf c.pdf        # multiple files in one call
   my-boox ls
-  my-boox del 6835ffbf89ac7242e1ada708
-  my-boox del 6835ffbf89ac7242e1ada708 6a6df289d2c1f36e5ee55b9d
+  my-boox del <id>
+  my-boox del <id1> <id2>
   my-boox -D ls                        # with raw API responses on stderr
 
 EXIT CODES
@@ -1050,11 +1137,6 @@ def main(argv):
         print_usage()
         return 201
 
-    if config_flag and config_override is None and rest:
-        # bare --config alongside a subcommand: no override given, just use
-        # normal resolution silently for this run
-        pass
-
     cmd = rest[0]
     cmd_args = rest[1:]
 
@@ -1064,6 +1146,11 @@ def main(argv):
 
     config_path = config_override or resolve_config_path(required=False)
     config = load_config(config_path)
+
+    global API_PACING, API_RETRY_ATTEMPTS, API_RETRY_DELAY
+    API_PACING = _config_float(config, "api_pacing_seconds", DEFAULT_PACING)
+    API_RETRY_ATTEMPTS = _config_int(config, "api_retry_attempts", DEFAULT_RETRY_ATTEMPTS)
+    API_RETRY_DELAY = _config_float(config, "api_retry_delay_seconds", DEFAULT_RETRY_DELAY)
 
     try:
         if cmd == "send":
