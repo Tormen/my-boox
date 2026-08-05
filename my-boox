@@ -26,8 +26,10 @@ version. Run the one-time cleanup script (see README) before switching.
       send: OSS upload -> _revs_diff -> _bulk_docs (new_edits=false) ->
             push/saveAndPush WITH cbMsg naming that document, so the
             server adopts it rather than registering a second one
-      del:  _revs_diff -> _bulk_docs tombstone ->
-            push/message/batchDelete for the same id
+      del:  _bulk_docs tombstone (one request for the whole batch) ->
+            push/message/batchDelete for every id at once. The browser
+            also sends a _revs_diff here; a send/delete round trip
+            watched on the device confirmed it is not needed.
   - a self-managed virtualenv under ~/.python.venv/my-boox (created and
     populated with its two dependencies -- requests, oss2 -- on first run;
     this script re-execs itself under that interpreter automatically)
@@ -59,6 +61,7 @@ err codes:
   205  re-auth step itself failed (no email configured / no code entered /
        stdin not a terminal / request-code or obtain-token call failed)
   206  no config file found, or the --config PATH given does not exist
+  130  interrupted with Ctrl-C
 """
 
 import contextlib
@@ -167,6 +170,7 @@ _bootstrap_venv()
 
 import configparser
 import json
+import re
 import calendar
 import locale
 import subprocess
@@ -216,7 +220,8 @@ send_skip_optional_calls = false
 cache_path =
 
 # cache_path: where the local /neocloud/ mirror is kept. Leave blank to
-# use the default, <this config file's path>.neocloud-cache.json. Set an
+# use the default, <config path with its extension replaced>.cache.json.
+# Set an
 # absolute path to put it somewhere else (e.g. to share one cache across
 # multiple config files, or keep it off a synced/backed-up directory).
 #
@@ -267,7 +272,7 @@ def _config_bool(config, key, default):
         return default
 
 
-VERSION = "4.0"
+VERSION = "4.1"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -305,6 +310,15 @@ class BooxAuthError(Exception):
 class BooxAPIError(Exception):
     """Raised for anything else that goes wrong talking to the API (bad
     JSON, an unexpected response shape). Not auto-retried."""
+
+
+class BooxSessionExpired(BooxAPIError):
+    """Raised when /neocloud/ rejects the SyncGatewaySession cookie.
+
+    Deliberately NOT a BooxAuthError: the account token is fine, only the
+    sync-gateway session is stale, and a new one is a single
+    users/syncToken call away. Treating it as an auth failure would send
+    the user a verification code and block on a prompt for no reason."""
 
 
 # ---------------------------------------------------------------------------
@@ -398,12 +412,43 @@ def save_config(path, config):
 # ---------------------------------------------------------------------------
 
 def cache_path_for(config_path):
-    return config_path + ".neocloud-cache.json"
+    """'~/.my-boox.conf' -> '~/.my-boox.cache.json'. The config's extension
+    is replaced rather than appended to, so the pair reads as two files
+    belonging to one tool instead of one long chain of suffixes."""
+    base, _ext = os.path.splitext(config_path)
+    return base + ".cache.json"
+
+
+_LEGACY_CACHE_SUFFIX = ".neocloud-cache.json"
 
 
 def resolve_cache_path(config, config_path):
     override = config["default"].get("cache_path", "").strip()
-    return override or cache_path_for(config_path)
+    if override:
+        return override
+
+    cache_path = cache_path_for(config_path)
+    # One-time migration off the older, longer name. Losing the cache is
+    # only a slow re-sync rather than a real problem, but there is no
+    # reason to make the user pay for it.
+    legacy = config_path + _LEGACY_CACHE_SUFFIX
+    if os.path.isfile(legacy) and not os.path.exists(cache_path):
+        with contextlib.suppress(OSError):
+            os.replace(legacy, cache_path)
+    return cache_path
+
+
+def _cached_session(cache, cloud, token):
+    """Return a (uid, session_id) pair persisted by a previous run, or
+    None. Keyed by (cloud, token) so a re-auth invalidates it rather than
+    reusing a session tied to the old credential."""
+    sess = cache.get("session") or {}
+    if (sess.get("cloud") == cloud and sess.get("token_tail") == (token or "")[-8:]
+            and sess.get("uid") and sess.get("session_id")):
+        if sess.get("expires_at") and time.time() > sess["expires_at"] - 3600:
+            return None
+        return sess["uid"], sess["session_id"]
+    return None
 
 
 def load_cache(cache_path):
@@ -462,14 +507,31 @@ def _redact(obj):
     return obj
 
 
+# Credential-bearing query parameters of a pre-signed OSS URL. Matched on
+# the serialized text rather than the object tree because the URL is buried
+# inside the document's 'content' field, which is itself a JSON-encoded
+# STRING -- _redact() walks right past it, so a -D log was still carrying a
+# usable signature and the full STS security token (which is also most of
+# the log's bulk: ~2.6KB per document).
+_SECRET_QUERY_RE = re.compile(
+    r"((?:Signature|security-token|OSSAccessKeyId|AccessKeyId|Expires)=)"
+    r"[^&\"'\\\s]+",
+    re.IGNORECASE,
+)
+
+
+def _mask_url_secrets(text):
+    return _SECRET_QUERY_RE.sub(r"\1<redacted>", text)
+
+
 def _debug_json(obj):
     """json.dumps for -D output, with credentials masked. Falls back to a
     plain repr if the payload isn't JSON-serializable -- a debug printer
     must never be the thing that raises."""
     try:
-        return json.dumps(_redact(obj), indent=2)
+        return _mask_url_secrets(json.dumps(_redact(obj), indent=2))
     except (TypeError, ValueError):
-        return repr(obj)
+        return _mask_url_secrets(repr(obj))
 
 
 def _get(d, *keys):
@@ -620,6 +682,7 @@ def do_obtain_token(cloud, email, code, debug=False):
 # per file.
 _UID_CACHE = {}
 _SESSION_CACHE = {}
+_SESSION_EXPIRES = {}
 _BUCKETS_CACHE = {}
 _STSS_CACHE = {}
 
@@ -648,6 +711,13 @@ def get_neocloud_cookie(cloud, token, debug=False):
     if key not in _SESSION_CACHE:
         payload = api_call(cloud, token, "users/syncToken", debug=debug)
         _SESSION_CACHE[key] = _get(payload, "data", "session_id")
+        raw = (payload.get("data") or {}).get("expires")
+        if raw:
+            try:
+                _SESSION_EXPIRES[key] = calendar.timegm(
+                    time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ"))
+            except (ValueError, TypeError):
+                _SESSION_EXPIRES.pop(key, None)
     return _SESSION_CACHE[key]
 
 
@@ -689,6 +759,45 @@ def get_stss(cloud, token, debug=False):
     return data
 
 
+def prime_session_from_cache(cloud, token, cache):
+    """Seed the in-process uid/session caches from the ones a previous run
+    persisted, so a plain 'ls' spends zero requests on users/me and
+    users/syncToken. The session carries its own multi-week expiry, and
+    _cached_session refuses one that is close to it."""
+    hit = _cached_session(cache, cloud, token)
+    if hit:
+        uid, session_id = hit
+        _UID_CACHE.setdefault((cloud, token), uid)
+        _SESSION_CACHE.setdefault((cloud, token), session_id)
+
+
+def store_session_in_cache(cache, cloud, token, uid, session_id):
+    cache["session"] = {
+        "cloud": cloud,
+        # Only a tail, so the cache file never carries a usable token.
+        "token_tail": (token or "")[-8:],
+        "uid": uid,
+        "session_id": session_id,
+        "expires_at": _SESSION_EXPIRES.get((cloud, token)),
+    }
+
+
+def with_fresh_session(cloud, token, fn, debug=False):
+    """Run fn(session_id), and if /neocloud/ rejects the session, drop it,
+    fetch a new one and retry ONCE. This is what makes persisting the
+    session across runs safe: a stale one costs one extra request, not a
+    failed command."""
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    try:
+        return fn(session_id)
+    except BooxSessionExpired:
+        if debug:
+            sys.stderr.write(">>> session rejected; fetching a fresh one\n")
+        _SESSION_CACHE.pop((cloud, token), None)
+        _SESSION_EXPIRES.pop((cloud, token), None)
+        return fn(get_neocloud_cookie(cloud, token, debug=debug))
+
+
 def neocloud_request(cloud, session_id, method, path, json_body=None,
                        params=None, debug=False):
     headers = {"Cookie": f"SyncGatewaySession={session_id}"}
@@ -717,6 +826,9 @@ def neocloud_request(cloud, session_id, method, path, json_body=None,
     if debug:
         sys.stderr.write(f"<<< {_debug_json(result)}\n")
 
+    if resp.status_code in (401, 403):
+        raise BooxSessionExpired(
+            f"neocloud/{path}: session rejected (HTTP {resp.status_code})")
     if resp.status_code >= 400:
         raise BooxAPIError(f"neocloud/{path} failed: HTTP {resp.status_code}: {result}")
 
@@ -752,6 +864,9 @@ def neocloud_get_doc(cloud, session_id, neocloud_id, debug=False):
     if debug:
         sys.stderr.write(f"<<< {_debug_json(result)}\n")
 
+    if resp.status_code in (401, 403):
+        raise BooxSessionExpired(
+            f"neocloud/{neocloud_id}: session rejected (HTTP {resp.status_code})")
     if resp.status_code >= 400:
         raise BooxAPIError(f"neocloud/{neocloud_id} lookup failed: HTTP {resp.status_code}: {result}")
 
@@ -786,29 +901,91 @@ def neocloud_delete_doc(cloud, session_id, neocloud_id, current_rev, debug=False
                       json_body={"docs": [doc], "new_edits": False}, debug=debug)
 
 
+def _tombstone_for(neocloud_id, current_rev):
+    """Build one tombstone document. Split out of neocloud_delete_doc so a
+    whole batch of them can go in a single _bulk_docs request."""
+    try:
+        start, parent_hash = str(current_rev).split("-", 1)
+        new_start = int(start) + 1
+    except ValueError as e:
+        raise BooxAPIError(
+            f"cannot delete {neocloud_id}: unparseable revision "
+            f"{current_rev!r} (expected '<int>-<hash>')"
+        ) from e
+    new_hash = uuid.uuid4().hex
+    return {
+        "_deleted": True,
+        "_id": neocloud_id,
+        "_rev": f"{new_start}-{new_hash}",
+        "_revisions": {"start": new_start, "ids": [new_hash, parent_hash]},
+    }
+
+
+def neocloud_delete_many(cloud, session_id, id_to_rev, debug=False):
+    """Tombstone every given document in ONE _bulk_docs request.
+
+    Sync Gateway takes an arbitrary number of docs per _bulk_docs call --
+    it is the same request shape the browser uses, just with more entries
+    in the list. Deleting them one at a time cost three paced requests per
+    file; a batch costs one for the whole set."""
+    docs = [_tombstone_for(doc_id, rev) for doc_id, rev in id_to_rev.items()]
+    if not docs:
+        return
+
+    # The browser sends a _revs_diff before this, but it is a pure CouchDB
+    # optimisation ("which of these revisions do you not already have?")
+    # with no side effects, and a send/delete round trip verified on the
+    # device confirmed the tombstone alone is what removes the file. Not
+    # worth a paced request -- during a gateway wobble it is also one more
+    # thing to sit through 504 backoff for.
+    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
+                      json_body={"docs": docs, "new_edits": False}, debug=debug)
+
+
 def refresh_cache(cloud, token, cache_path, debug=False):
-    """Incrementally sync the local cache with /neocloud/: one cheap
-    _changes call for everything since the last known cursor (id + rev +
-    deleted-status for every changed document), then fetches the full body
-    (name/size/etc.) only for genuinely new or changed LIVE documents.
-    Cheap on every call after the first; the first run pays the cost of
-    fetching every existing file's body once. Returns the up-to-date
+    """Incrementally sync the local cache with /neocloud/ in ONE request.
+
+    `_changes` is asked for `include_docs=true`, so every changed document
+    arrives with its full body (name/size/timestamps) inline. Previously
+    this made one `_changes` call and then a separate GET per new or
+    changed document -- at the default 1.5s pacing, a first sync over 100
+    files was 100 extra round trips, several minutes of pure waiting, for
+    data the same response can carry for free.
+
+    Sync Gateway's `_bulk_get` would also batch this, but it answers as
+    multipart/mixed (a browser capture of it here returned HTTP 406
+    "Response is multipart"), so it would need content negotiation and a
+    MIME parser to read. `include_docs` needs neither.
+
+    A GET per document remains as a fallback for the case where a change
+    arrives without its body, which shouldn't happen but costs one request
+    each if it ever does. Returns the up-to-date
     {doc_id: {"name":, "size":, "rev":, "createdAt":, "updatedAt":}} dict."""
+    # Loaded first so the uid/session persisted by the previous run can be
+    # reused: without this every command spends two paced requests on
+    # users/me and users/syncToken before it does anything at all.
+    cache = load_cache(cache_path)
+    prime_session_from_cache(cloud, token, cache)
+
     uid = get_uid(cloud, token, debug=debug)
     channel = f"{uid}-MESSAGE"
-    session_id = get_neocloud_cookie(cloud, token, debug=debug)
 
-    cache = load_cache(cache_path)
-    result = neocloud_request(
-        cloud, session_id, "GET", "_changes",
-        params={
-            "style": "all_docs",
-            "filter": "sync_gateway/bychannel",
-            "channels": channel,
-            "since": cache["last_seq"],
-        },
-        debug=debug,
-    )
+    def fetch(session_id):
+        return neocloud_request(
+            cloud, session_id, "GET", "_changes",
+            params={
+                "style": "all_docs",
+                "filter": "sync_gateway/bychannel",
+                "channels": channel,
+                "since": cache["last_seq"],
+                "include_docs": "true",
+            },
+            debug=debug,
+        )
+
+    result = with_fresh_session(cloud, token, fetch, debug=debug)
+    session_id = get_neocloud_cookie(cloud, token, debug=debug)
+    store_session_in_cache(cache, cloud, token, uid, session_id)
 
     for r in result.get("results", []):
         doc_id = r.get("id")
@@ -820,17 +997,23 @@ def refresh_cache(cloud, token, cache_path, debug=False):
         changes = r.get("changes", [])
         if not changes:
             continue
-        doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
-        if doc:
-            cache["docs"][doc_id] = {
-                "name": doc.get("name"),
-                "size": doc.get("size"),
-                "rev": doc.get("_rev", changes[0]["rev"]),
-                "createdAt": doc.get("createdAt"),
-                "updatedAt": doc.get("updatedAt"),
-            }
-        else:
+
+        doc = r.get("doc")
+        if doc is None:
+            doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
+        # A tombstone can arrive as an inline doc with _deleted set rather
+        # than the top-level "deleted" flag; both mean the file is gone.
+        if not doc or doc.get("_deleted"):
             cache["docs"].pop(doc_id, None)
+            continue
+
+        cache["docs"][doc_id] = {
+            "name": doc.get("name"),
+            "size": doc.get("size"),
+            "rev": doc.get("_rev", changes[0]["rev"]),
+            "createdAt": doc.get("createdAt"),
+            "updatedAt": doc.get("updatedAt"),
+        }
 
     cache["last_seq"] = result.get("last_seq", cache["last_seq"])
     save_cache(cache_path, cache)
@@ -840,10 +1023,22 @@ def refresh_cache(cloud, token, cache_path, debug=False):
 def neocloud_write_doc(cloud, session_id, doc_id, rev_str, revisions, uid,
                          basename, resource_type, remotename, size,
                          sign_url_fn, debug=False):
-    """Write one /neocloud/ document, in the exact shape the web client
-    posts (verified field-for-field against a HAR of a browser upload):
-    _revs_diff to announce the revision, then _bulk_docs with
-    new_edits=false and an explicit _rev/_revisions."""
+    """Write ONE /neocloud/ document. write_docs_batch() is the batched
+    equivalent and is what 'send' actually uses; this remains as the
+    single-document form."""
+    doc = _content_doc(doc_id, rev_str, revisions, uid, basename,
+                       resource_type, remotename, size, sign_url_fn)
+    neocloud_request(cloud, session_id, "POST", "_revs_diff",
+                      json_body={doc_id: [rev_str]}, debug=debug)
+    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
+                      json_body={"docs": [doc], "new_edits": False}, debug=debug)
+
+
+def _content_doc(doc_id, rev_str, revisions, uid, basename, resource_type,
+                 remotename, size, sign_url_fn):
+    """Build one /neocloud/ document in the exact shape the web client
+    posts -- verified field-for-field against a HAR of a browser upload.
+    Shared by the single and batched write paths so the two cannot drift."""
     now_ms = int(time.time() * 1000)
     content_obj = {
         "_id": doc_id,
@@ -885,23 +1080,30 @@ def neocloud_write_doc(cloud, session_id, doc_id, rev_str, revisions, uid,
         "_rev": rev_str,
         "_revisions": revisions,
     }
-    neocloud_request(cloud, session_id, "POST", "_revs_diff",
-                      json_body={doc_id: [rev_str]}, debug=debug)
-    neocloud_request(cloud, session_id, "POST", "_bulk_docs",
-                      json_body={"docs": [doc], "new_edits": False}, debug=debug)
+    return doc
 
 
-def do_send(cloud, token, filename, skip_optional=False, debug=False):
+def send_preamble(cloud, token, skip_optional=False, debug=False):
+    """The per-RUN part of a send: getDevice and im/getSig, whose responses
+    are both discarded. They exist because the upstream project mirrored
+    the web client's call sequence, and the browser makes them once when
+    the page loads -- not once per file. Making them per-file cost two
+    paced requests for every single file and bought nothing."""
     uid = get_uid(cloud, token, debug=debug)
-
-    # getDevice and im/getSig: both responses are discarded -- they exist
-    # because the upstream project mirrored the web client's call sequence.
-    # They may well be pure ceremony, but saveAndPush also looked redundant
-    # right up until dropping it delivered 0 of 14 files, so they stay on
-    # by default and are only skipped if explicitly configured.
     if not skip_optional:
         api_call(cloud, token, "users/getDevice", debug=debug)
         api_call(cloud, token, "im/getSig", params={"user": uid}, debug=debug)
+    return uid
+
+
+def upload_one(cloud, token, filename, debug=False):
+    """Upload a single file to OSS and return everything needed to write
+    its /neocloud/ document later. Splitting the upload from the document
+    write is what lets a whole batch of documents go in one _bulk_docs.
+
+    The OSS transfer itself does not go through the paced request layer --
+    it is a bulk data transfer to a different host, not an API call."""
+    uid = get_uid(cloud, token, debug=debug)
 
     onyx_cloud = get_buckets(cloud, token, debug=debug)
     bucket_name = onyx_cloud["bucket"]
@@ -929,29 +1131,34 @@ def do_send(cloud, token, filename, skip_optional=False, debug=False):
     resource_type = extension.lstrip(".").lower() or "txt"
     size = os.path.getsize(filename)
 
-    sign_url_fn = lambda key: bucket.sign_url(
-        "GET", key, 3 * 3600,
-        params={"response-content-disposition": "attachment"},
-    )
-
-    # Our own neocloud document (confirmed necessary for real device
-    # delivery -- saveAndPush's own server-side write alone was tried and
-    # failed to deliver a whole batch of real files).
-    doc_id = uuid.uuid4().hex
-    rev1_hash = uuid.uuid4().hex
-    session_id = get_neocloud_cookie(cloud, token, debug=debug)
-    try:
-        neocloud_write_doc(
-            cloud, session_id, doc_id, f"1-{rev1_hash}", {"start": 1, "ids": [rev1_hash]},
-            uid, basename, resource_type, remotename, size, sign_url_fn, debug=debug,
+    def sign_url_fn(key):
+        return bucket.sign_url(
+            "GET", key, 3 * 3600,
+            params={"response-content-disposition": "attachment"},
         )
-    except (BooxAPIError, BooxAuthError) as e:
-        raise BooxAPIError(
-            f"neocloud delivery write failed: {e} -- nothing was "
-            f"registered or delivered, safe to just retry 'send'"
-        ) from e
 
-    final_rev = f"1-{rev1_hash}"
+    rev1_hash = uuid.uuid4().hex
+    return {
+        "doc_id": uuid.uuid4().hex,
+        "rev": f"1-{rev1_hash}",
+        "revisions": {"start": 1, "ids": [rev1_hash]},
+        "uid": uid,
+        "basename": basename,
+        "resource_type": resource_type,
+        "remotename": remotename,
+        "size": size,
+        "bucket_name": bucket_name,
+        "sign_url_fn": sign_url_fn,
+    }
+
+
+def finalize_send(cloud, token, item, debug=False):
+    """The api/1 half of a send, once the document is written: one
+    saveAndPush per file. Unlike the /neocloud/ write this one cannot be
+    batched -- the call carries a single resource."""
+    doc_id, final_rev = item["doc_id"], item["rev"]
+    basename, remotename = item["basename"], item["remotename"]
+    resource_type, bucket_name = item["resource_type"], item["bucket_name"]
 
     # saveAndPush, with 'cbMsg' naming the document we just wrote.
     #
@@ -988,7 +1195,35 @@ def do_send(cloud, token, filename, skip_optional=False, debug=False):
     if cb_id == doc_id:
         cb_id, cb_rev = None, None
 
-    return doc_id, final_rev, basename, size, cb_id, cb_rev
+    return doc_id, final_rev, basename, item["size"], cb_id, cb_rev
+
+
+def write_docs_batch(cloud, session_id, items, debug=False):
+    """Write every prepared document in ONE _revs_diff plus ONE _bulk_docs,
+    which is exactly the shape the browser uses -- its _revs_diff announces
+    every revision it knows about at once, and _bulk_docs takes a list. A
+    per-file write cost two paced requests per file for no benefit."""
+    if not items:
+        return
+
+    revs_diff_body = {item["doc_id"]: [item["rev"]] for item in items}
+    docs = [
+        _content_doc(item["doc_id"], item["rev"], item["revisions"], item["uid"],
+                     item["basename"], item["resource_type"], item["remotename"],
+                     item["size"], item["sign_url_fn"])
+        for item in items
+    ]
+
+    try:
+        neocloud_request(cloud, session_id, "POST", "_revs_diff",
+                         json_body=revs_diff_body, debug=debug)
+        neocloud_request(cloud, session_id, "POST", "_bulk_docs",
+                         json_body={"docs": docs, "new_edits": False}, debug=debug)
+    except (BooxAPIError, BooxAuthError) as e:
+        raise BooxAPIError(
+            f"neocloud delivery write failed: {e} -- nothing was "
+            f"registered or delivered, safe to just retry 'send'"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1298,7 @@ def cmd_send(config, config_path, filenames, debug=False):
     cache_path = resolve_cache_path(config, config_path)
     missing = []   # never existed locally -- exit 202
     failed = []    # tried and failed -- exit 204
+    uploaded = []  # in OSS, awaiting the batched /neocloud/ write
 
     check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
     skip_optional = _config_bool(config, "send_skip_optional_calls", False)
@@ -1085,6 +1321,24 @@ def cmd_send(config, config_path, filenames, debug=False):
                 # duplicate check silently never fires.
                 existing.add((str(name), _as_int(size)))
 
+    # Once per run, not once per file -- and lazily, so a run where every
+    # file turns out to be missing or a duplicate spends no requests at all.
+    preamble_done = []
+
+    def run_preamble_once():
+        if preamble_done:
+            return
+        preamble_done.append(True)
+
+        def preamble(token):
+            return send_preamble(cloud, token, skip_optional=skip_optional,
+                                 debug=debug)
+
+        try:
+            with_reauth(preamble, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: preflight call failed, continuing: {e}\n")
+
     for raw_filename in filenames:
         filename = os.path.abspath(os.path.expanduser(raw_filename))
         if not os.path.isfile(filename):
@@ -1103,14 +1357,15 @@ def cmd_send(config, config_path, filenames, debug=False):
             print(f"skipped: {basename} (already present, same name and size)")
             continue
 
+        run_preamble_once()
+
         def action(token, filename=filename):
-            return do_send(cloud, token, filename,
-                           skip_optional=skip_optional, debug=debug)
+            return upload_one(cloud, token, filename, debug=debug)
 
         try:
-            result = with_reauth(action, config, config_path, debug=debug)
+            item = with_reauth(action, config, config_path, debug=debug)
         except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: failed to send {basename}: {e}\n")
+            sys.stderr.write(f"my-boox: failed to upload {basename}: {e}\n")
             failed.append(raw_filename)
             continue
         except Exception as e:
@@ -1124,14 +1379,49 @@ def cmd_send(config, config_path, filenames, debug=False):
             if debug:
                 raise
             sys.stderr.write(
-                f"my-boox: failed to send {basename}: {type(e).__name__}: {e}\n"
+                f"my-boox: failed to upload {basename}: {type(e).__name__}: {e}\n"
             )
             failed.append(raw_filename)
             continue
 
-        print(f"sent: {basename}")
+        item["raw_filename"] = raw_filename
+        uploaded.append(item)
         if check_duplicates:
             existing.add((basename, size))
+
+    # One _revs_diff + one _bulk_docs for the whole batch, then the api/1
+    # half per file. Nothing is registered or delivered until this runs, so
+    # a failure here means every uploaded file failed together -- the OSS
+    # objects are orphaned but harmless, and re-running 'send' is safe.
+    if uploaded:
+        def write_batch(token):
+            session_id = get_neocloud_cookie(cloud, token, debug=debug)
+            write_docs_batch(cloud, session_id, uploaded, debug=debug)
+
+        try:
+            with_reauth(write_batch, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: {e}\n")
+            die(
+                f"my-boox: {len(uploaded)} of {len(filenames)} failed: " +
+                ", ".join(item["raw_filename"] for item in uploaded),
+                204,
+            )
+
+    for item in uploaded:
+        basename, raw_filename = item["basename"], item["raw_filename"]
+
+        def action(token, item=item):
+            return finalize_send(cloud, token, item, debug=debug)
+
+        try:
+            result = with_reauth(action, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            sys.stderr.write(f"my-boox: failed to send {basename}: {e}\n")
+            failed.append(raw_filename)
+            continue
+
+        print(f"sent: {basename}")
 
         if result:
             doc_id, rev, name, doc_size, cb_id, cb_rev = result
@@ -1260,38 +1550,72 @@ def cmd_ls(config, config_path, debug=False):
     return groups
 
 
-def do_delete_one(cloud, token, doc_id, debug=False):
-    """Delete a single file the same way the web UI does: write the
-    /neocloud/ tombstone, then tell the api/1 side about it.
+def do_delete_batch(cloud, token, doc_ids, known_revs, debug=False):
+    """Delete any number of files in a FIXED number of requests, the same
+    way the web UI does it: tombstone the /neocloud/ documents, then tell
+    the api/1 side about them.
 
-    The browser does BOTH, in that order -- _revs_diff + _bulk_docs to
-    tombstone the sync-gateway document, then
-    api/1/push/message/batchDelete with the same id. Earlier versions of
-    this tool only did the first half, which is why a deleted file could
-    come back or linger: the tombstone removes it from /neocloud/, but
-    the push-message record it is paired with survives untouched."""
+    Both halves are required. The tombstone removes the file from
+    /neocloud/; batchDelete removes the push-message record it is paired
+    with. Doing only the first is why a deleted file could linger.
+
+    Both halves also take a whole batch at once -- _bulk_docs has always
+    accepted a list of docs, and batchDelete's field is literally 'ids' --
+    so N files cost two requests, not 2N. Revisions come from the caller
+    (one _changes refresh covers every document); only an id that refresh
+    didn't see costs an individual GET.
+
+    Returns (deleted_ids, not_found_ids)."""
     session_id = get_neocloud_cookie(cloud, token, debug=debug)
-    doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
-    if not doc:
-        return False
 
-    neocloud_delete_doc(cloud, session_id, doc_id, doc["_rev"], debug=debug)
-    api_call(cloud, token, "push/message/batchDelete",
-             data={"ids": [doc_id]}, debug=debug)
-    return True
+    id_to_rev = {}
+    not_found = []
+    for doc_id in doc_ids:
+        rev = known_revs.get(doc_id)
+        if not rev:
+            doc = neocloud_get_doc(cloud, session_id, doc_id, debug=debug)
+            rev = doc.get("_rev") if doc else None
+        if rev:
+            id_to_rev[doc_id] = rev
+        else:
+            not_found.append(doc_id)
+
+    if id_to_rev:
+        neocloud_delete_many(cloud, session_id, id_to_rev, debug=debug)
+        api_call(cloud, token, "push/message/batchDelete",
+                 data={"ids": list(id_to_rev)}, debug=debug)
+
+    return list(id_to_rev), not_found
 
 
 def cmd_del(config, config_path, ids, debug=False):
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     cache_path = resolve_cache_path(config, config_path)
 
-    # Each logical file is backed by more than one /neocloud/ document (our
-    # own write plus saveAndPush's cbMsg -- see group_docs). Deleting only
-    # the id shown by 'ls' would leave the sibling behind, so expand every
-    # requested id into its whole group first. Ids not present in the cache
-    # (never seen by 'ls', or already deleted) fall through unexpanded and
-    # are attempted as-is.
-    cached_docs = load_cache(cache_path)["docs"]
+    # One refresh up front, which costs a single _changes request and
+    # gives the CURRENT revision of every document. That is what makes the
+    # batched tombstone below safe: writing a stale revision with
+    # new_edits=false would fork the document rather than delete it, so
+    # the revisions have to be fresh, and fetching them one GET at a time
+    # was the old cost. It also means an id that no longer exists is known
+    # to be gone without spending a request on it.
+    def refresh(token):
+        return refresh_cache(cloud, token, cache_path, debug=debug)
+
+    try:
+        cached_docs = with_reauth(refresh, config, config_path, debug=debug) or {}
+    except (BooxAPIError, BooxAuthError) as e:
+        sys.stderr.write(
+            f"my-boox: could not refresh before deleting ({e}); "
+            f"falling back to the last known revisions\n"
+        )
+        cached_docs = load_cache(cache_path)["docs"]
+
+    # Each logical file may be backed by more than one /neocloud/ document
+    # (anything sent before v4.0 has a stray second one -- see group_docs).
+    # Deleting only the id shown by 'ls' would leave the sibling behind, so
+    # expand every requested id into its whole group first. Ids not present
+    # in the cache fall through unexpanded and are attempted as-is.
     id_to_group = {}
     for g in group_docs(cached_docs):
         for member in g["ids"]:
@@ -1308,45 +1632,33 @@ def cmd_del(config, config_path, ids, debug=False):
         print(f"note: expanded {len(ids)} id(s) to {len(targets)} underlying "
               f"document(s) -- each file is backed by more than one")
 
-    succeeded = []
-    untracked = []
-    failures = []
+    known_revs = {doc_id: meta.get("rev")
+                  for doc_id, meta in cached_docs.items() if meta.get("rev")}
 
-    for doc_id in targets:
-        def action(token, doc_id=doc_id):
-            return do_delete_one(cloud, token, doc_id, debug=debug)
+    def action(token):
+        return do_delete_batch(cloud, token, targets, known_revs, debug=debug)
 
-        try:
-            found = with_reauth(action, config, config_path, debug=debug)
-        except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: failed to delete {doc_id}: {e}\n")
-            failures.append(doc_id)
-            continue
+    try:
+        deleted, untracked = with_reauth(action, config, config_path, debug=debug)
+    except (BooxAPIError, BooxAuthError) as e:
+        sys.stderr.write(f"my-boox: failed to delete: {e}\n")
+        die(f"my-boox: none of the {len(targets)} document(s) were deleted", 204)
 
-        cache = load_cache(cache_path)
+    cache = load_cache(cache_path)
+    for doc_id in deleted + untracked:
         cache["docs"].pop(doc_id, None)
-        save_cache(cache_path, cache)
+    save_cache(cache_path, cache)
 
-        if found:
-            print(f"deleted: {doc_id}")
-            succeeded.append(doc_id)
-        else:
-            print(f"not found: {doc_id} (already gone, or never existed)")
-            untracked.append(doc_id)
+    for doc_id in deleted:
+        print(f"deleted: {doc_id}")
+    for doc_id in untracked:
+        print(f"not found: {doc_id} (already gone, or never existed)")
 
     if untracked:
         print(
             "note: no live document found for " + ", ".join(untracked) +
             " -- genuinely ambiguous between already-deleted (common if "
             "re-running del on the same id) and never having existed."
-        )
-    print("(run 'my-boox ls' to refresh the cache and confirm)")
-
-    if failures:
-        die(
-            f"my-boox: {len(failures)} of {len(targets)} failed to delete: " +
-            ", ".join(failures),
-            204,
         )
 
 
@@ -1376,7 +1688,7 @@ class TestCacheAndGrouping(unittest.TestCase):
             config_path = os.path.join(tmpdir, "my-boox.ini")
             config = load_config(config_path)
             cache_path = resolve_cache_path(config, config_path)
-            self.assertTrue(cache_path.endswith("my-boox.ini.neocloud-cache.json"))
+            self.assertTrue(cache_path.endswith("my-boox.cache.json"))
 
             cache = {"last_seq": "0", "docs": {"abc": {"name": "report.pdf", "size": 42, "rev": "1-abc"}}}
             save_cache(cache_path, cache)
@@ -1459,7 +1771,12 @@ class TestCommandHandlers(unittest.TestCase):
 
             with mock.patch.object(module, "refresh_cache", return_value={}), \
                  mock.patch.object(module, "with_reauth", side_effect=lambda action, *args, **kwargs: action("token")), \
-                 mock.patch.object(module, "do_send", return_value=("doc-1", "1-abc", "sample.txt", 11, "cb-1", "1-cb")) as send_mock:
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "upload_one", return_value=_fake_item()) as send_mock, \
+                 mock.patch.object(module, "finalize_send",
+                                   return_value=("doc-1", "1-abc", "sample.txt", 11, "cb-1", "1-cb")):
                 stdout = io.StringIO()
                 with contextlib.redirect_stdout(stdout):
                     cmd_send(config, config_path, [sample], debug=False)
@@ -1516,12 +1833,13 @@ class TestCommandHandlers(unittest.TestCase):
 
             deleted = []
 
-            def fake_delete(cloud, token, doc_id, debug=False):
-                deleted.append(doc_id)
-                return True
+            def fake_delete(cloud, token, doc_ids, known_revs, debug=False):
+                deleted.extend(doc_ids)
+                return list(doc_ids), []
 
             with mock.patch.object(module, "with_reauth", side_effect=lambda action, *args, **kwargs: action("token")), \
-                 mock.patch.object(module, "do_delete_one", side_effect=fake_delete):
+                 mock.patch.object(module, "refresh_cache", return_value=cache["docs"]), \
+                 mock.patch.object(module, "do_delete_batch", side_effect=fake_delete):
                 stdout = io.StringIO()
                 with contextlib.redirect_stdout(stdout):
                     cmd_del(config, config_path, ["doc-a"], debug=False)
@@ -1531,6 +1849,17 @@ class TestCommandHandlers(unittest.TestCase):
             self.assertNotIn("doc-a", reloaded["docs"])
             self.assertNotIn("doc-b", reloaded["docs"])
             self.assertIn("deleted: doc-b", stdout.getvalue())
+
+
+def _fake_item(doc_id="doc-1", rev="1-abc", basename="sample.txt", size=11):
+    """An upload_one() result, for tests that exercise everything after the
+    OSS upload without performing one."""
+    return {
+        "doc_id": doc_id, "rev": rev, "revisions": {"start": 1, "ids": [rev.split("-", 1)[1]]},
+        "uid": "uid1", "basename": basename, "resource_type": "txt",
+        "remotename": f"uid1/push/{doc_id}.txt", "size": size,
+        "bucket_name": "onyx-cloud", "sign_url_fn": lambda key: "https://oss.invalid/" + key,
+    }
 
 
 class _FakeResponse:
@@ -1823,6 +2152,30 @@ class TestRegressions(unittest.TestCase):
         self.assertIn("redacted", out)
         self.assertIn("users/syncToken", out)  # still useful for debugging
 
+    # -- the signed OSS URL lives inside the document's 'content' field,
+    #    which is a JSON-encoded STRING. _redact walks past it, so a -D log
+    #    still carried a usable signature and the whole STS security token.
+    def test_debug_masks_signed_url_buried_in_a_json_string_field(self):
+        signed = ("https://onyx-cloud.oss.example/uid/push/f.txt"
+                  "?response-content-disposition=attachment"
+                  "&security-token=STSTOKENVALUE123"
+                  "&OSSAccessKeyId=STS.KEYID999"
+                  "&Expires=1785979285"
+                  "&Signature=SIGVALUE%3D")
+        payload = {"results": [{"doc": {
+            "name": "f.txt",
+            # Exactly how it arrives: a stringified JSON blob.
+            "content": json.dumps({"name": "f.txt",
+                                   "storage": {"txt": {"oss": {"url": signed}}}}),
+        }}]}
+
+        out = _debug_json(payload)
+        for secret in ("STSTOKENVALUE123", "STS.KEYID999", "SIGVALUE"):
+            self.assertNotIn(secret, out)
+        # Still readable: the filename and the object path survive.
+        self.assertIn("f.txt", out)
+        self.assertIn("uid/push/f.txt", out)
+
     def test_redaction_keeps_signed_url_path_but_drops_signature(self):
         redacted = _redact({"url": "https://oss.example/u/push/f.pdf"
                                    "?Expires=1&OSSAccessKeyId=k&Signature=abc123"})
@@ -1848,14 +2201,19 @@ class TestRegressions(unittest.TestCase):
             class _OssError(Exception):
                 pass
 
-            def flaky_send(cloud, token, filename, **kwargs):
+            def flaky_upload(cloud, token, filename, **kwargs):
                 if filename.endswith("bad.pdf"):
                     raise _OssError("RequestError: connection aborted")
-                return ("doc-good", "1-g", "good.pdf", 8, "cb-good", "1-cbg")
+                return _fake_item("doc-good", "1-g", "good.pdf", 8)
 
             with mock.patch.object(module, "with_reauth",
                                    side_effect=lambda action, *a, **k: action("token")), \
-                 mock.patch.object(module, "do_send", side_effect=flaky_send):
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "finalize_send",
+                                   return_value=("doc-good", "1-g", "good.pdf", 8, "cb-good", "1-cbg")), \
+                 mock.patch.object(module, "upload_one", side_effect=flaky_upload):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(stdout), \
                      contextlib.redirect_stderr(stderr), \
@@ -1864,7 +2222,7 @@ class TestRegressions(unittest.TestCase):
 
             # The good file still went, and the exit code reports the bad one.
             self.assertIn("sent: good.pdf", stdout.getvalue())
-            self.assertIn("failed to send bad.pdf", stderr.getvalue())
+            self.assertIn("failed to upload bad.pdf", stderr.getvalue())
             self.assertEqual(ctx.exception.code, 204)
             self.assertIn("doc-good", load_cache(resolve_cache_path(config, config_path))["docs"])
 
@@ -1898,7 +2256,12 @@ class TestRegressions(unittest.TestCase):
 
             with mock.patch.object(module, "with_reauth",
                                    side_effect=lambda action, *a, **k: action("token")), \
-                 mock.patch.object(module, "do_send",
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "upload_one",
+                                   return_value=_fake_item("doc-new", "1-n", "fresh.pdf", 1)), \
+                 mock.patch.object(module, "finalize_send",
                                    return_value=("doc-new", "1-n", "fresh.pdf", 1, None, None)):
                 with contextlib.redirect_stdout(io.StringIO()):
                     cmd_send(config, config_path, [sample], debug=False)
@@ -1981,6 +2344,8 @@ class TestRegressions(unittest.TestCase):
     def test_send_hands_saveandpush_our_own_document_as_cbmsg(self):
         module = sys.modules[__name__]
         calls = []
+        oss_stub = mock.MagicMock()
+        oss_stub.Bucket.return_value.sign_url.return_value = "https://oss.invalid/signed"
 
         def fake_api_call(cloud, token, api_url, **kwargs):
             calls.append((api_url, kwargs.get("data")))
@@ -1992,8 +2357,11 @@ class TestRegressions(unittest.TestCase):
 
         written = {}
 
-        def fake_write_doc(cloud, session_id, doc_id, rev_str, revisions, *a, **k):
-            written["doc_id"], written["rev"] = doc_id, rev_str
+        def fake_neocloud(cloud, session_id, method, path, json_body=None, **k):
+            if path == "_revs_diff":
+                (doc_id, revs), = json_body.items()
+                written["doc_id"], written["rev"] = doc_id, revs[0]
+            return {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             sample = os.path.join(tmpdir, "report.pdf")
@@ -2010,10 +2378,12 @@ class TestRegressions(unittest.TestCase):
                                    return_value={"AccessKeyId": "k",
                                                  "AccessKeySecret": "s",
                                                  "SecurityToken": "t"}), \
-                 mock.patch.object(module, "neocloud_write_doc", side_effect=fake_write_doc), \
-                 mock.patch.object(module, "oss2", mock.MagicMock()):
-                doc_id, rev, name, size, cb_id, cb_rev = do_send(
-                    "example.invalid", "tok", sample, skip_optional=True)
+                 mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud), \
+                 mock.patch.object(module, "oss2", oss_stub):
+                item = upload_one("example.invalid", "tok", sample)
+                write_docs_batch("example.invalid", "sess", [item])
+                doc_id, rev, name, size, cb_id, cb_rev = finalize_send(
+                    "example.invalid", "tok", item)
 
         save = dict(calls)["push/saveAndPush"]
         self.assertEqual(save["cbMsg"], {"id": doc_id, "rev": rev})
@@ -2048,10 +2418,11 @@ class TestRegressions(unittest.TestCase):
                                    return_value={"AccessKeyId": "k",
                                                  "AccessKeySecret": "s",
                                                  "SecurityToken": "t"}), \
-                 mock.patch.object(module, "neocloud_write_doc"), \
+                 mock.patch.object(module, "neocloud_request", return_value={}), \
                  mock.patch.object(module, "oss2", mock.MagicMock()):
-                _, _, _, _, cb_id, cb_rev = do_send(
-                    "example.invalid", "tok", sample, skip_optional=True)
+                item = upload_one("example.invalid", "tok", sample)
+                _, _, _, _, cb_id, cb_rev = finalize_send(
+                    "example.invalid", "tok", item)
 
         self.assertEqual((cb_id, cb_rev), ("server-made-its-own", "1-server"))
 
@@ -2065,8 +2436,8 @@ class TestRegressions(unittest.TestCase):
         def fake_get_doc(cloud, session_id, doc_id, debug=False):
             return {"_id": doc_id, "_rev": "2-abc"}
 
-        def fake_delete_doc(cloud, session_id, doc_id, rev, debug=False):
-            order.append(("tombstone", doc_id, rev))
+        def fake_delete_many(cloud, session_id, id_to_rev, debug=False):
+            order.append(("tombstone", dict(id_to_rev)))
 
         def fake_api_call(cloud, token, api_url, **kwargs):
             order.append(("api", api_url, kwargs.get("data")))
@@ -2074,14 +2445,18 @@ class TestRegressions(unittest.TestCase):
 
         with mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
              mock.patch.object(module, "neocloud_get_doc", side_effect=fake_get_doc), \
-             mock.patch.object(module, "neocloud_delete_doc", side_effect=fake_delete_doc), \
+             mock.patch.object(module, "neocloud_delete_many", side_effect=fake_delete_many), \
              mock.patch.object(module, "api_call", side_effect=fake_api_call):
-            found = do_delete_one("example.invalid", "tok", "doc123")
+            deleted, not_found = do_delete_batch(
+                "example.invalid", "tok", ["doc123", "doc456"],
+                {"doc123": "2-abc", "doc456": "3-def"})
 
-        self.assertTrue(found)
+        self.assertEqual((deleted, not_found), (["doc123", "doc456"], []))
+        # Two files, still exactly two requests: one batched tombstone and
+        # one batchDelete naming both ids.
         self.assertEqual(order, [
-            ("tombstone", "doc123", "2-abc"),
-            ("api", "push/message/batchDelete", {"ids": ["doc123"]}),
+            ("tombstone", {"doc123": "2-abc", "doc456": "3-def"}),
+            ("api", "push/message/batchDelete", {"ids": ["doc123", "doc456"]}),
         ])
 
     # -- oss2 defaults a scheme-less endpoint to http://, so uploads went
@@ -2089,6 +2464,7 @@ class TestRegressions(unittest.TestCase):
     def test_upload_endpoint_is_forced_to_https(self):
         module = sys.modules[__name__]
         oss_stub = mock.MagicMock()
+        oss_stub.Bucket.return_value.sign_url.return_value = "https://oss.invalid/signed"
 
         def fake_api_call(cloud, token, api_url, **kwargs):
             if api_url == "push/saveAndPush":
@@ -2110,9 +2486,9 @@ class TestRegressions(unittest.TestCase):
                                    return_value={"AccessKeyId": "k",
                                                  "AccessKeySecret": "s",
                                                  "SecurityToken": "t"}), \
-                 mock.patch.object(module, "neocloud_write_doc"), \
+                 mock.patch.object(module, "neocloud_request", return_value={}), \
                  mock.patch.object(module, "oss2", oss_stub):
-                do_send("example.invalid", "tok", sample, skip_optional=True)
+                upload_one("example.invalid", "tok", sample)
 
         endpoint = oss_stub.Bucket.call_args[0][1]
         self.assertEqual(endpoint, "https://oss-us-west-1.aliyuncs.com")
@@ -2123,7 +2499,9 @@ class TestRegressions(unittest.TestCase):
         with mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
              mock.patch.object(module, "neocloud_get_doc", return_value=None), \
              mock.patch.object(module, "api_call", api):
-            self.assertFalse(do_delete_one("example.invalid", "tok", "gone"))
+            deleted, not_found = do_delete_batch(
+                "example.invalid", "tok", ["gone"], {})
+        self.assertEqual((deleted, not_found), ([], ["gone"]))
         api.assert_not_called()
 
     def test_tombstone_body_matches_the_browsers_bulk_docs_shape(self):
@@ -2148,6 +2526,194 @@ class TestRegressions(unittest.TestCase):
         self.assertEqual(doc["_revisions"],
                          {"start": 2,
                           "ids": [new_hash, "f068b0c3797e16957832fb5e94a311c5"]})
+
+    # -- refresh_cache used to make one _changes call and then a GET per
+    #    new/changed document. At 1.5s pacing a 100-file first sync was
+    #    100 avoidable round trips.
+    def test_refresh_reads_bodies_inline_with_no_per_document_get(self):
+        module = sys.modules[__name__]
+        paths = []
+
+        def fake_neocloud(cloud, session_id, method, path, params=None, **k):
+            paths.append(path)
+            return {"last_seq": "9", "results": [
+                {"id": f"doc{i}", "changes": [{"rev": "1-a"}],
+                 "doc": {"_id": f"doc{i}", "_rev": "1-a", "name": f"f{i}.pdf",
+                         "size": i, "createdAt": i, "updatedAt": i}}
+                for i in range(1, 26)
+            ]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_get_doc") as per_doc_get, \
+                 mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
+                docs = refresh_cache("example.invalid", "tok", cache_path)
+
+        self.assertEqual(len(docs), 25)
+        self.assertEqual(docs["doc7"]["name"], "f7.pdf")
+        self.assertEqual(paths, ["_changes"])   # 25 documents, one request
+        per_doc_get.assert_not_called()
+
+    def test_refresh_asks_for_inline_docs_and_honours_tombstones(self):
+        module = sys.modules[__name__]
+        seen = {}
+
+        def fake_neocloud(cloud, session_id, method, path, params=None, **k):
+            seen.update(params or {})
+            return {"last_seq": "3", "results": [
+                {"id": "live", "changes": [{"rev": "1-a"}],
+                 "doc": {"_rev": "1-a", "name": "keep.pdf", "size": 1}},
+                {"id": "gone", "changes": [{"rev": "2-b"}], "deleted": True},
+                # A tombstone can also arrive as an inline doc with _deleted.
+                {"id": "gone2", "changes": [{"rev": "2-c"}],
+                 "doc": {"_rev": "2-c", "_deleted": True}},
+            ]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            save_cache(cache_path, {"last_seq": "0", "docs": {
+                "gone": {"name": "old.pdf", "size": 1, "rev": "1-x"},
+                "gone2": {"name": "old2.pdf", "size": 1, "rev": "1-y"}}})
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
+                docs = refresh_cache("example.invalid", "tok", cache_path)
+
+        self.assertEqual(seen.get("include_docs"), "true")
+        self.assertEqual(sorted(docs), ["live"])
+
+    def test_a_stale_session_is_refreshed_once_instead_of_failing(self):
+        module = sys.modules[__name__]
+        sessions = iter(["stale-session", "fresh-session"])
+        used = []
+
+        def fn(session_id):
+            used.append(session_id)
+            if session_id == "stale-session":
+                raise BooxSessionExpired("session rejected")
+            return "ok"
+
+        with mock.patch.object(module, "get_neocloud_cookie",
+                               side_effect=lambda *a, **k: next(sessions)):
+            self.assertEqual(
+                with_fresh_session("example.invalid", "tok", fn), "ok")
+        self.assertEqual(used, ["stale-session", "fresh-session"])
+
+    def test_session_cache_is_keyed_to_the_credential_and_never_stores_it(self):
+        cache = {"last_seq": "0", "docs": {}}
+        store_session_in_cache(cache, "eur.boox.com", "tok-abcdefghij",
+                               "uid1", "sess1")
+        self.assertNotIn("tok-abcdefghij", json.dumps(cache))
+        self.assertEqual(
+            _cached_session(cache, "eur.boox.com", "tok-abcdefghij"),
+            ("uid1", "sess1"))
+        # A different account, cloud, or a refreshed token: no reuse.
+        self.assertIsNone(_cached_session(cache, "eur.boox.com", "different-token"))
+        self.assertIsNone(_cached_session(cache, "push.boox.com", "tok-abcdefghij"))
+
+    def test_batched_tombstone_is_a_single_bulk_docs_request(self):
+        """Deleting N files costs one _bulk_docs, not one per file and no
+        _revs_diff: a send/delete round trip watched on the real device
+        confirmed the tombstone alone removes the file."""
+        module = sys.modules[__name__]
+        calls = []
+
+        def capture(cloud, session_id, method, path, json_body=None, **k):
+            calls.append((path, json_body))
+            return {}
+
+        with mock.patch.object(module, "neocloud_request", side_effect=capture):
+            neocloud_delete_many("example.invalid", "sess", {
+                "docA": "1-aaaa", "docB": "2-bbbb"})
+
+        self.assertEqual([p for p, _ in calls], ["_bulk_docs"])
+        bulk = calls[0][1]
+        self.assertIs(bulk["new_edits"], False)
+        tombstones = {d["_id"]: d["_rev"] for d in bulk["docs"]}
+        self.assertEqual(sorted(tombstones), ["docA", "docB"])
+        # Each tombstone is the parent's revision number plus one.
+        self.assertTrue(tombstones["docA"].startswith("2-"))
+        self.assertTrue(tombstones["docB"].startswith("3-"))
+
+    def test_send_writes_every_document_in_one_batch(self):
+        module = sys.modules[__name__]
+        bodies = []
+
+        def fake_neocloud(cloud, session_id, method, path, json_body=None, **k):
+            bodies.append((path, json_body))
+            return {}
+
+        items = [_fake_item(f"doc{i}", f"1-r{i}", f"f{i}.txt", i)
+                 for i in range(1, 15)]
+        with mock.patch.object(module, "neocloud_request", side_effect=fake_neocloud):
+            write_docs_batch("example.invalid", "sess", items)
+
+        # 14 files -> exactly two requests, both carrying all 14.
+        self.assertEqual([p for p, _ in bodies], ["_revs_diff", "_bulk_docs"])
+        self.assertEqual(len(bodies[0][1]), 14)
+        self.assertEqual(len(bodies[1][1]["docs"]), 14)
+        self.assertIs(bodies[1][1]["new_edits"], False)
+
+    def test_preflight_calls_are_made_once_per_run_not_once_per_file(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+            paths = []
+            for name in ("a.txt", "b.txt", "c.txt"):
+                p = os.path.join(tmpdir, name)
+                with open(p, "w") as handle:
+                    handle.write("x")
+                paths.append(p)
+
+            preamble = mock.Mock(return_value="uid1")
+            with mock.patch.object(module, "with_reauth",
+                                   side_effect=lambda action, *a, **k: action("token")), \
+                 mock.patch.object(module, "send_preamble", preamble), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "upload_one",
+                                   side_effect=lambda c, t, f, **k: _fake_item(
+                                       os.path.basename(f), "1-a", os.path.basename(f), 1)), \
+                 mock.patch.object(module, "finalize_send",
+                                   return_value=("d", "1-a", "x.txt", 1, None, None)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cmd_send(config, config_path, paths, debug=False)
+
+            self.assertEqual(preamble.call_count, 1)
+
+    def test_no_requests_at_all_when_every_file_is_missing(self):
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            config["default"]["duplicate_check_on_send"] = "false"
+            preamble = mock.Mock()
+            with mock.patch.object(module, "send_preamble", preamble), \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit):
+                cmd_send(config, config_path,
+                         [os.path.join(tmpdir, "nope.pdf")], debug=False)
+        preamble.assert_not_called()
+
+    # -- Ctrl-C during a paced sleep or a socket read used to print a
+    #    30-line traceback through requests/urllib3/ssl.
+    def test_ctrl_c_exits_130_with_one_line(self):
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "main", side_effect=KeyboardInterrupt), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = _run(["ls"])
+        self.assertEqual(rc, 130)
+        self.assertEqual(err.getvalue().strip(), "my-boox: interrupted")
+
+    def test_closing_a_pipe_early_is_not_an_error(self):
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "main", side_effect=BrokenPipeError), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(_run(["ls"]), 0)
 
     def test_delete_rejects_an_unparseable_revision(self):
         with self.assertRaises(BooxAPIError):
@@ -2235,15 +2801,16 @@ COMMANDS
                     Use the ID shown with 'del'.
 
   del ID [ID...]   Delete one or more files by ID (as shown by 'ls'),
-                    again mirroring the web UI: tombstone the /neocloud/
-                    document (_revs_diff + _bulk_docs), then
+                    following the web UI: tombstone the /neocloud/
+                    document (_bulk_docs), then
                     api/1/push/message/batchDelete for the same id. Both
                     halves are needed -- the tombstone alone leaves the
                     paired push-message record behind.
-                    Each id is deleted independently and confirmed as it
-                    happens; if one fails, the rest of the batch still
-                    goes ahead, with a summary and nonzero exit code if
-                    anything genuinely failed.
+                    Any number of ids costs three requests in total: one
+                    refresh to learn the current revisions, one _bulk_docs
+                    carrying every tombstone, one batchDelete naming every
+                    id. If the whole call fails nothing is deleted and the
+                    exit code is nonzero.
                     Files sent by a pre-4.0 my-boox have a second, stray
                     document; 'del' expands each id to its whole group so
                     those go too.
@@ -2325,7 +2892,7 @@ CONFIG
             be required for delivery, so test on-device before trusting
             this for a real batch.
   cache_path  -- where the local /neocloud/ mirror is kept. Blank (default)
-            uses '<this config file's path>.neocloud-cache.json'. Set an
+            uses '<config path>.cache.json'. Set an
             absolute path to use somewhere else. See LOCAL CACHE below for
             the file's structure.
 
@@ -2352,7 +2919,8 @@ CONFIG
   entirely for that single run.
 
 LOCAL CACHE
-  By default, '<config path>.neocloud-cache.json' mirrors /neocloud/'s
+  By default, '<config path>.cache.json' (e.g. ~/.my-boox.cache.json)
+  mirrors /neocloud/'s
   contents (id, name, size, rev, timestamps), refreshed incrementally on
   every 'ls' via one cheap _changes call plus a body fetch only for
   new/changed documents. This is what 'ls' and 'del' actually read/act on.
@@ -2392,6 +2960,7 @@ EXIT CODES
        request-code/obtain-token API call itself failed)
   206  no config file found (search order exhausted, or the --config PATH
        given does not exist)
+  130  interrupted with Ctrl-C
 """)
 
 
@@ -2531,5 +3100,24 @@ def main(argv):
     return 201
 
 
+def _run(argv):
+    """main() plus the signal handling that only makes sense for a real
+    process. Ctrl-C during a paced sleep or a socket read otherwise dumps a
+    30-line traceback through requests/urllib3/ssl, which looks like a
+    crash rather than 'you pressed Ctrl-C'. 130 is the conventional exit
+    code for death by SIGINT."""
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        # Leading newline so the message clears the shell's '^C'.
+        sys.stderr.write("\nmy-boox: interrupted\n")
+        return 130
+    except BrokenPipeError:
+        # 'my-boox ls | head' closes the pipe early; that is not an error.
+        with contextlib.suppress(OSError):
+            sys.stdout.close()
+        return 0
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(_run(sys.argv[1:]))

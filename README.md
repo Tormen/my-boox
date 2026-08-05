@@ -50,7 +50,7 @@ Notable fixes and discoveries along the way:
   | command | sequence |
   | --- | --- |
   | `send` | OSS upload (https) → `_revs_diff` → `_bulk_docs` (`new_edits=false`) → `push/saveAndPush` **with `cbMsg`** naming that document |
-  | `del` | `_revs_diff` → `_bulk_docs` tombstone → `push/message/batchDelete` with the same id |
+  | `del` | `_bulk_docs` tombstone → `push/message/batchDelete` with the same id |
 
   Both halves of each are load-bearing:
 
@@ -66,6 +66,36 @@ Notable fixes and discoveries along the way:
   Files sent by a pre-v4.0 `my-boox` still carry that stray second
   document. `ls` groups by (name, size) so they show as one row, and `del`
   expands each id to its whole group, so both go.
+- **Bulk endpoints everywhere they exist (v4.1).** Wall-clock time is
+  dominated by `api_pacing_seconds` (1.5s between requests, which is what
+  keeps Onyx's backend from throwing `504`s), so the win is making fewer
+  requests rather than pacing them harder:
+
+  | command | before | now |
+  | --- | --- | --- |
+  | `ls`, N new/changed docs | `3 + N` | `1` warm, `3` cold |
+  | `del`, N ids | `1 + 3N` | `3` |
+  | `send`, N files | `~5N` | `N + 4` |
+
+  - `_changes?include_docs=true` returns every document body inline, so
+    the per-document `GET` is gone. (`_bulk_get`, which the browser uses,
+    answers as `multipart/mixed` — HTTP 406 in the capture — and would
+    need a MIME parser for the same data.)
+  - `_bulk_docs` takes the whole batch in one request, for both the
+    document writes on `send` and the tombstones on `del`; `batchDelete`
+    already took an `ids` list. `send` keeps the `_revs_diff` the
+    browser sends before its write; `del` does not — a send/delete round
+    trip watched on the device confirmed the tombstone alone removes the
+    file, and it is a no-op optimisation in CouchDB terms.
+  - `uid` and the sync-gateway session are cached in the local cache file
+    (never the token itself — only an 8-character tail, to key the entry),
+    so a warm `ls` is a **single** request. A rejected session is refetched
+    once automatically rather than failing the command.
+  - `users/getDevice` and `im/getSig` run once per run, not once per file.
+
+  Measured against a live account: 3-file `send` 15.7s, cold `ls` 3.7s,
+  warm `ls` 0.57s, 3-file `del` 3 requests. Sent files were confirmed to
+  appear on the device and to vanish again after `del`.
 - **A central pacing/retry layer.** Every outgoing request — across `send`,
   `ls`, and `del` alike — goes through one function that paces requests and
   retries transient failures (`502`/`503`/`504`, connection errors,
@@ -81,11 +111,6 @@ Notable fixes and discoveries along the way:
   local incremental cache for listing and deletion, so there's nothing
   left to diverge from. `send` still also calls `saveAndPush`, per above —
   that one, unlike the listing, is genuinely load-bearing.
-- **One fewer request per `del`.** `del` used to fetch a `/neocloud/`
-  session twice per file — once to check the current revision, again
-  (redundantly) inside the tombstone submission itself. The second is now
-  the same already-fetched session, saving a request (and its pacing
-  delay) on every single delete.
 
 ## Install
 
@@ -165,7 +190,8 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
   redundant-looking call (`saveAndPush`) turned out to be required for
   delivery, so test on-device before trusting it for a real batch.
 - `cache_path` — where the local `/neocloud/` mirror is kept. Blank
-  (default) uses `<this config file's path>.neocloud-cache.json`. Set an
+  (default) uses the config path with its extension replaced by
+  `.cache.json` (so `~/.my-boox.conf` -> `~/.my-boox.cache.json`). Set an
   absolute path to use somewhere else — e.g. to share one cache across
   multiple config files, or keep it off a synced/backed-up directory. See
   [Local cache](#local-cache) below for the file's structure.
@@ -202,7 +228,7 @@ my-boox --config /path/to/other.ini ls
 
 ## Local cache
 
-By default, `<config path>.neocloud-cache.json` mirrors `/neocloud/`'s
+By default, `<config path>.cache.json` mirrors `/neocloud/`'s
 contents. `ls` refreshes it incrementally on every call — one cheap
 `_changes` request covering everything since the last known cursor, then a
 body fetch only for genuinely new or changed documents. The first `ls`
@@ -271,7 +297,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v4.0**.
+Current release: **v4.1**.
 
 ## Exit codes
 
@@ -283,6 +309,7 @@ Current release: **v4.0**.
 | 204 | action failed even after re-auth retry, or a file failed to upload |
 | 205 | re-auth step itself failed (no email configured, no code entered, stdin not a terminal, or the request-code/obtain-token call failed) |
 | 206 | no config file found, or the `--config PATH` given does not exist |
+| 130 | interrupted with Ctrl-C |
 
 ## License
 
