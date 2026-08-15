@@ -248,7 +248,7 @@ api_retry_attempts = 5
 api_retry_delays_seconds = 3, 5, 10
 api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
-duplicate_check_on_send = true
+on_duplicate_name = replace
 send_skip_optional_calls = false
 cache_path =
 
@@ -338,6 +338,32 @@ def _config_delays(config: configparser.ConfigParser, key: str,
     return delays or default
 
 
+ON_DUPLICATE_CHOICES = ("replace", "skip", "keep-both")
+
+
+def _config_on_duplicate(config: configparser.ConfigParser) -> str:
+    """What 'send' does when a file's name is already on the device.
+
+    replace   -- upload the new copy, then remove the old one (default)
+    skip      -- leave the device alone and do not upload
+    keep-both -- upload regardless, leaving both copies in place
+
+    Names are compared case-insensitively either way. Falls back to the
+    older boolean 'duplicate_check_on_send', where false meant 'do not
+    look at what is already there'."""
+    raw = config["default"].get("on_duplicate_name", "").strip().lower()
+    if raw:
+        if raw in ON_DUPLICATE_CHOICES:
+            return raw
+        sys.stderr.write(
+            f"my-boox: on_duplicate_name = {raw!r} is not one of "
+            f"{', '.join(ON_DUPLICATE_CHOICES)}; using 'replace'\n")
+        return "replace"
+    if not _config_bool(config, "duplicate_check_on_send", True):
+        return "keep-both"
+    return "replace"
+
+
 def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> bool:
     try:
         return config["default"].getboolean(key, fallback=default)
@@ -345,7 +371,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.5"
+VERSION = "5.6"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -444,7 +470,9 @@ def load_config(path: str) -> configparser.ConfigParser:
     # genuinely absent, otherwise an existing api_retry_delay_seconds could
     # never be honoured as the fallback.
     config["default"].setdefault("api_timeout_seconds", str(DEFAULT_TIMEOUT))
-    config["default"].setdefault("duplicate_check_on_send", "true")
+    # NOT setdefault-ed, for the same reason as the retry delays:
+    # _config_on_duplicate has to be able to see that the key is genuinely
+    # absent, or the legacy duplicate_check_on_send could never be honoured.
     config["default"].setdefault("send_skip_optional_calls", "false")
     config["default"].setdefault("cache_path", "")
     return config
@@ -1476,27 +1504,36 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
     missing = []   # never existed locally -- exit 202
     failed = []    # tried and failed -- exit 204
     uploaded = []  # in OSS, awaiting the batched /neocloud/ write
+    replaced: List[Tuple[str, List[str]]] = []   # (name, ids it supersedes)
 
-    check_duplicates = _config_bool(config, "duplicate_check_on_send", True)
+    # Replace, rather than skip. Sending a file whose name is already on the
+    # device now means "make this the copy that is there": the new one is
+    # uploaded, and only once it has landed is the old one removed. Skipping
+    # on (name, size) meant an explicit 'send' could silently do nothing --
+    # and it false-matched a DIFFERENT file that happened to share a name and
+    # a byte count, which is exactly what a name like '2.deepdive.pdf' in two
+    # directories produces.
+    on_duplicate = _config_on_duplicate(config)
     skip_optional = _config_bool(config, "send_skip_optional_calls", False)
+    replace_existing = on_duplicate == "replace"
 
-    existing = set()
-    if check_duplicates:
+    # basename (casefolded) -> ids of the documents currently holding it
+    superseded: Dict[str, List[str]] = {}
+    if on_duplicate in ("replace", "skip"):
         def fetch_existing(token: Optional[str]) -> Any:
             return refresh_cache(cloud, token, cache_path, debug=debug)
 
         try:
             docs = with_reauth(fetch_existing, config, config_path, debug=debug) or {}
         except (BooxAPIError, BooxAuthError) as e:
-            sys.stderr.write(f"my-boox: duplicate check failed, continuing without it: {e}\n")
+            sys.stderr.write(
+                f"my-boox: could not list what is already there, so nothing "
+                f"will be replaced this run: {e}\n")
             docs = {}
-        for meta in docs.values():
-            name, size = meta.get("name"), meta.get("size")
-            if name is not None and size is not None:
-                # _as_int for the same reason group_docs needs it: a
-                # server-side "42" must match a local getsize() 42, or the
-                # duplicate check silently never fires.
-                existing.add((str(name), _as_int(size)))
+        # Case-insensitively: the device and the web UI treat 'Report.pdf'
+        # and 'report.pdf' as the same file, and so should we.
+        for group in group_docs(docs):
+            superseded.setdefault(str(group["name"]).casefold(), []).extend(group["ids"])
 
     # Once per run, not once per file -- and lazily, so a run where every
     # file turns out to be missing or a duplicate spends no requests at all.
@@ -1525,13 +1562,16 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
 
         basename = os.path.basename(filename)
         try:
-            size = os.path.getsize(filename)
+            # Still stat'd, though the size is no longer part of any match:
+            # it is a cheap readability probe that fails here rather than
+            # part-way through an upload.
+            os.path.getsize(filename)
         except OSError as e:
             sys.stderr.write(f"my-boox: cannot read {basename}: {e}\n")
             failed.append(raw_filename)
             continue
-        if check_duplicates and (basename, size) in existing:
-            print(f"skipped: {basename} (already present, same name and size)")
+        if on_duplicate == "skip" and basename.casefold() in superseded:
+            print(f"skipped: {basename} (already there; on_duplicate_name = skip)")
             continue
 
         run_preamble_once()
@@ -1569,9 +1609,10 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
             continue
 
         item["raw_filename"] = raw_filename
+        # Captured before the send so the copy we are about to write can
+        # never be in its own replacement list.
+        item["superseded"] = superseded.get(basename.casefold(), [])
         uploaded.append(item)
-        if check_duplicates:
-            existing.add((basename, size))
 
     # One _revs_diff + one _bulk_docs for the whole batch, then the api/1
     # half per file. Nothing is registered or delivered until this runs, so
@@ -1627,6 +1668,46 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
                     "createdAt": now_ms, "updatedAt": now_ms,
                 }
             save_cache(cache_path, cache)
+            if item.get("superseded"):
+                replaced.append((basename, list(item["superseded"])))
+
+    # Only now, with the new copies registered and delivered, is it safe to
+    # drop the ones they supersede. Doing it the other way round would mean
+    # a failed send leaves the device with neither copy.
+    if replace_existing and replaced:
+        stale: List[str] = []
+        for _name, ids in replaced:
+            for doc_id in ids:
+                if doc_id not in stale:
+                    stale.append(doc_id)
+
+        cached_docs = load_cache(cache_path)["docs"]
+        known_revs = {doc_id: meta["rev"] for doc_id, meta in cached_docs.items()
+                      if meta.get("rev")}
+
+        def drop_old(token: Optional[str]) -> Any:
+            return do_delete_batch(cloud, token, stale, known_revs, debug=debug)
+
+        try:
+            removed, _absent = with_reauth(drop_old, config, config_path, debug=debug)
+        except (BooxAPIError, BooxAuthError) as e:
+            # The new copies are already there; failing here leaves a
+            # duplicate behind, which is untidy but not lossy.
+            sys.stderr.write(
+                f"my-boox: sent, but could not remove the older copies "
+                f"({e}) -- run 'my-boox ls' and delete them by hand\n")
+            removed = []
+
+        cache = load_cache(cache_path)
+        for doc_id in stale:
+            cache["docs"].pop(doc_id, None)
+        save_cache(cache_path, cache)
+
+        for name, ids in replaced:
+            gone = sum(1 for doc_id in ids if doc_id in removed)
+            if gone:
+                print(f"replaced: {name} ({gone} older cop"
+                      f"{'y' if gone == 1 else 'ies'} removed)")
 
     problems = missing + failed
     if problems:
@@ -1892,7 +1973,7 @@ class TestConfigHandling(unittest.TestCase):
             config_path = os.path.join(tmpdir, "my-boox.ini")
             config = load_config(config_path)
             self.assertEqual(config["default"]["cloud"], DEFAULT_CLOUD)
-            self.assertEqual(config["default"]["duplicate_check_on_send"], "true")
+            self.assertEqual(_config_on_duplicate(config), "replace")
             self.assertEqual(config["default"]["send_skip_optional_calls"], "false")
 
             save_config(config_path, config)
@@ -3227,6 +3308,106 @@ class TestRegressions(unittest.TestCase):
         # --cached is meaningless for a send, and that run does need the venv
         self.assertFalse(_should_skip_venv_bootstrap(["send", "--cached", "a.pdf"]))
 
+    # -- an explicit 'send' silently did nothing when a DIFFERENT file
+    #    happened to share a name and a byte count (the same report name in
+    #    two directories). It now replaces, and matches names case-blind.
+    def _send_with_existing(self, existing_docs: Dict[str, Any], names: Sequence[str],
+                            on_duplicate: str = "replace") -> Any:
+        module = sys.modules[__name__]
+        deleted: List[str] = []
+
+        def fake_delete(cloud: Any, token: Any, doc_ids: Any, known_revs: Any,
+                        debug: bool = False) -> Any:
+            deleted.extend(doc_ids)
+            return list(doc_ids), []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            config["default"]["on_duplicate_name"] = on_duplicate
+            cache_path = resolve_cache_path(config, config_path)
+            save_cache(cache_path, {"last_seq": "1", "docs": existing_docs})
+
+            paths: List[str] = []
+            for name in names:
+                path = os.path.join(tmpdir, name)
+                with open(path, "w") as handle:
+                    handle.write("new content")
+                paths.append(path)
+
+            with mock.patch.object(module, "with_reauth", side_effect=_run_action), \
+                 mock.patch.object(module, "refresh_cache", return_value=existing_docs), \
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "do_delete_batch", side_effect=fake_delete), \
+                 mock.patch.object(module, "upload_one",
+                                   side_effect=lambda c, t, f, **k: _fake_item(
+                                       "new-" + os.path.basename(f), "1-n",
+                                       os.path.basename(f), 11)), \
+                 mock.patch.object(module, "finalize_send",
+                                   side_effect=lambda c, t, item, **k: (
+                                       item["doc_id"], item["rev"], item["basename"],
+                                       item["size"], None, None)):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cmd_send(config, config_path, paths, debug=False)
+        return stdout.getvalue(), deleted
+
+    def test_send_replaces_a_same_named_file_instead_of_skipping(self) -> None:
+        out, deleted = self._send_with_existing(
+            {"old1": {"name": "2.deepdive.pdf", "size": 207002, "rev": "1-o",
+                      "updatedAt": 1}},
+            ["2.deepdive.pdf"])
+        self.assertIn("sent: 2.deepdive.pdf", out)
+        self.assertNotIn("skipped", out)
+        self.assertEqual(deleted, ["old1"])           # old copy removed
+        self.assertIn("replaced: 2.deepdive.pdf (1 older copy removed)", out)
+
+    def test_name_matching_is_case_insensitive(self) -> None:
+        _out, deleted = self._send_with_existing(
+            {"old1": {"name": "REPORT.PDF", "size": 5, "rev": "1-o", "updatedAt": 1}},
+            ["report.pdf"])
+        self.assertEqual(deleted, ["old1"])
+
+    def test_a_different_name_is_left_alone(self) -> None:
+        out, deleted = self._send_with_existing(
+            {"old1": {"name": "other.pdf", "size": 11, "rev": "1-o", "updatedAt": 1}},
+            ["report.pdf"])
+        self.assertEqual(deleted, [])
+        self.assertNotIn("replaced:", out)
+
+    def test_keep_both_uploads_without_removing_anything(self) -> None:
+        out, deleted = self._send_with_existing(
+            {"old1": {"name": "report.pdf", "size": 5, "rev": "1-o", "updatedAt": 1}},
+            ["report.pdf"], on_duplicate="keep-both")
+        self.assertIn("sent: report.pdf", out)
+        self.assertEqual(deleted, [])
+
+    def test_skip_leaves_the_device_alone(self) -> None:
+        out, deleted = self._send_with_existing(
+            {"old1": {"name": "report.pdf", "size": 5, "rev": "1-o", "updatedAt": 1}},
+            ["report.pdf"], on_duplicate="skip")
+        self.assertIn("skipped: report.pdf", out)
+        self.assertNotIn("sent:", out)
+        self.assertEqual(deleted, [])
+
+    def test_on_duplicate_name_parsing_and_legacy_fallback(self) -> None:
+        config = configparser.ConfigParser()
+        config["default"] = {}
+        self.assertEqual(_config_on_duplicate(config), "replace")
+
+        config["default"]["duplicate_check_on_send"] = "false"
+        self.assertEqual(_config_on_duplicate(config), "keep-both")
+
+        config["default"]["on_duplicate_name"] = "SKIP"
+        self.assertEqual(_config_on_duplicate(config), "skip")
+
+        config["default"]["on_duplicate_name"] = "nonsense"
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(_config_on_duplicate(config), "replace")
+        self.assertIn("not one of", err.getvalue())
+
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
             neocloud_delete_doc("example.invalid", "sess", "docid", "no-dash-here")
@@ -3392,7 +3573,7 @@ CONFIG
       api_retry_attempts = 5
       api_retry_delays_seconds = 3, 5, 10
 api_retry_delays_repeat_seconds = 3, 10
-      duplicate_check_on_send = true
+      on_duplicate_name = replace
 
   email  -- the address tied to your Onyx account. Required: this is who
             re-auth emails a fresh verification code to.
@@ -3427,9 +3608,16 @@ api_retry_delays_repeat_seconds = 3, 10
             verification-code calls) is never replayed automatically,
             because a 504 means the gateway stopped waiting -- not that
             the server did nothing.
-  duplicate_check_on_send   -- true/false. When true (default), 'send'
-            skips any file whose name AND size already match something
-            already present. Set false to always upload regardless.
+  on_duplicate_name        -- what 'send' does when a file's name is
+            already on the device. Names are compared CASE-INSENSITIVELY.
+              replace   (default) upload the new copy, then remove the old
+                        one. The removal happens only after the new copy is
+                        registered, so a failed send never leaves you with
+                        neither.
+              keep-both upload regardless; both copies stay.
+              skip      leave the device alone and do not upload.
+            The older boolean duplicate_check_on_send is still read: false
+            maps to keep-both.
   send_skip_optional_calls -- true/false, default false. 'send' makes two
             calls (users/getDevice, im/getSig) whose responses are thrown
             away; they exist only because the upstream project mirrored

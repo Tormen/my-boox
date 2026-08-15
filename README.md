@@ -177,7 +177,7 @@ api_retry_attempts = 5
 api_retry_delays_seconds = 3, 5, 10
 api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
-duplicate_check_on_send = true
+on_duplicate_name = replace
 cache_path =
 ```
 
@@ -223,9 +223,25 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
   gateway stopped waiting, not that the server did nothing, so a blind retry
   could register the same push twice. Those failures say so and point you at
   `my-boox ls`.
-- `duplicate_check_on_send` — `true`/`false`. When `true` (default),
-  `send` skips any file whose name and size already match something on
-  your account. Set `false` to always upload regardless.
+- `on_duplicate_name` — what `send` does when a file's name is already on
+  the device. Names are compared **case-insensitively** (`Report.pdf` and
+  `report.pdf` are the same file).
+
+  | value | behaviour |
+  | --- | --- |
+  | `replace` *(default)* | upload the new copy, then remove the old one |
+  | `keep-both` | upload regardless; both copies stay |
+  | `skip` | leave the device alone, do not upload |
+
+  Under `replace` the old copy is removed **only after** the new one is
+  registered, so a failed send never leaves you with neither. If the removal
+  itself fails you keep a duplicate — untidy, not lossy — and `send` says so.
+
+  This replaces the old skip-on-(name, size) behaviour, which could silently
+  do nothing for an explicit `send` and false-matched a *different* file that
+  happened to share a name and a byte count — e.g. the same report name in
+  two directories. The older boolean `duplicate_check_on_send` is still read:
+  `false` maps to `keep-both`.
 - `send_skip_optional_calls` — `true`/`false`, default `false`. `send`
   makes two calls (`users/getDevice`, `im/getSig`) whose responses are
   discarded; they exist only because the upstream project mirrored the web
@@ -341,7 +357,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.5**.
+Current release: **v5.6**.
 
 ## Type checking
 
