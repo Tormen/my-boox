@@ -40,7 +40,7 @@ version. Run the one-time cleanup script (see README) before switching.
     my-* script conventions
 
 Usage:
-  my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]
+  my-boox [-D|--debug] [--config PATH] [-f|--force] send <FILE> [FILE...]
   my-boox [-D|--debug] [--config PATH] [-c|--cached] ls|list
   my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]
   my-boox [--config [PATH]]         # print resolved config path and exit
@@ -196,6 +196,7 @@ _bootstrap_venv()
 # ---------------------------------------------------------------------------
 
 import configparser
+import hashlib
 import json
 import re
 import calendar
@@ -249,6 +250,7 @@ api_retry_delays_seconds = 3, 5, 10
 api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
 on_duplicate_name = replace
+force_send = false
 send_skip_optional_calls = false
 cache_path =
 
@@ -341,6 +343,17 @@ def _config_delays(config: configparser.ConfigParser, key: str,
 ON_DUPLICATE_CHOICES = ("replace", "skip", "keep-both")
 
 
+def file_md5(path: str) -> str:
+    """Streaming md5 of a local file, used to tell 'already there and
+    identical' from 'already there but changed'. Streamed rather than read
+    whole so a 500MB book costs no more memory than a 5KB note."""
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _config_on_duplicate(config: configparser.ConfigParser) -> str:
     """What 'send' does when a file's name is already on the device.
 
@@ -371,7 +384,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.6"
+VERSION = "5.7"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version
@@ -1214,13 +1227,21 @@ def _apply_changes(cloud: str, cache: Cache, results: Sequence[Dict[str, Any]],
             cache["docs"].pop(doc_id, None)
             continue
 
-        cache["docs"][doc_id] = {
+        entry: DocMeta = {
             "name": doc.get("name"),
             "size": doc.get("size"),
             "rev": doc.get("_rev", changes[0]["rev"]),
             "createdAt": doc.get("createdAt"),
             "updatedAt": doc.get("updatedAt"),
         }
+        # The server does not store our content hash (it keeps md5 as ""),
+        # so carry forward whatever we recorded when we sent this document.
+        # Without this every refresh would forget it and every re-send would
+        # look like a change.
+        previous = cache["docs"].get(doc_id) or {}
+        if previous.get("md5"):
+            entry["md5"] = previous["md5"]
+        cache["docs"][doc_id] = entry
 
 
 def _content_doc(doc_id: str, rev_str: str, revisions: Dict[str, Any], uid: str,
@@ -1331,6 +1352,7 @@ def upload_one(cloud: str, token: Optional[str], filename: str,
 
     rev1_hash = uuid.uuid4().hex
     return {
+        "md5": file_md5(filename),
         "doc_id": uuid.uuid4().hex,
         "rev": f"1-{rev1_hash}",
         "revisions": {"start": 1, "ids": [rev1_hash]},
@@ -1498,7 +1520,8 @@ def with_reauth(action: Callable[[Optional[str]], Any],
 # ---------------------------------------------------------------------------
 
 def cmd_send(config: configparser.ConfigParser, config_path: str,
-             filenames: Sequence[str], debug: bool = False) -> None:
+             filenames: Sequence[str], debug: bool = False,
+             force: bool = False) -> None:
     cloud = config["default"].get("cloud") or DEFAULT_CLOUD
     cache_path = resolve_cache_path(config, config_path)
     missing = []   # never existed locally -- exit 202
@@ -1514,11 +1537,15 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
     # a byte count, which is exactly what a name like '2.deepdive.pdf' in two
     # directories produces.
     on_duplicate = _config_on_duplicate(config)
+    # --force on the command line, or force_send in the config, sends a file
+    # even when the copy already there is byte-for-byte identical.
+    force = force or _config_bool(config, "force_send", False)
     skip_optional = _config_bool(config, "send_skip_optional_calls", False)
     replace_existing = on_duplicate == "replace"
 
     # basename (casefolded) -> ids of the documents currently holding it
     superseded: Dict[str, List[str]] = {}
+    fingerprints: Dict[str, List[Tuple[int, str]]] = {}
     if on_duplicate in ("replace", "skip"):
         def fetch_existing(token: Optional[str]) -> Any:
             return refresh_cache(cloud, token, cache_path, debug=debug)
@@ -1534,6 +1561,13 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
         # and 'report.pdf' as the same file, and so should we.
         for group in group_docs(docs):
             superseded.setdefault(str(group["name"]).casefold(), []).extend(group["ids"])
+        # (size, md5) of every document, so an unchanged file can be
+        # recognised without uploading it again.
+        for doc_id, meta in docs.items():
+            if meta.get("name") is None:
+                continue
+            fingerprints.setdefault(str(meta["name"]).casefold(), []).append(
+                (_as_int(meta.get("size"), -1), str(meta.get("md5") or "")))
 
     # Once per run, not once per file -- and lazily, so a run where every
     # file turns out to be missing or a duplicate spends no requests at all.
@@ -1573,6 +1607,18 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
         if on_duplicate == "skip" and basename.casefold() in superseded:
             print(f"skipped: {basename} (already there; on_duplicate_name = skip)")
             continue
+
+        # Nothing to do if the copy already there is byte-for-byte this file.
+        # Hashing is skipped unless a candidate matches on size, so a run over
+        # a directory of unchanged files reads only the files that could
+        # plausibly still match.
+        if on_duplicate == "replace" and not force:
+            local_size = os.path.getsize(filename)
+            candidates = [md5 for size, md5 in fingerprints.get(basename.casefold(), [])
+                          if md5 and size == local_size]
+            if candidates and file_md5(filename) in candidates:
+                print(f"unchanged: {basename}")
+                continue
 
         run_preamble_once()
 
@@ -1658,6 +1704,9 @@ def cmd_send(config: configparser.ConfigParser, config_path: str,
             cache["docs"][doc_id] = {
                 "name": name, "size": doc_size, "rev": rev,
                 "createdAt": now_ms, "updatedAt": now_ms,
+                # Recorded so the next run can tell this file has not
+                # changed; the server keeps md5 as "" and cannot tell us.
+                "md5": item.get("md5", ""),
             }
             # Only set when the server declined to adopt our document and
             # made its own anyway; grouped with the above by (name, size)
@@ -3408,6 +3457,103 @@ class TestRegressions(unittest.TestCase):
             self.assertEqual(_config_on_duplicate(config), "replace")
         self.assertIn("not one of", err.getvalue())
 
+    # -- re-sending a directory should only move what actually changed.
+    def _send_against(self, existing_docs: Dict[str, Any], content: str,
+                      name: str = "report.pdf", force: bool = False) -> Any:
+        module = sys.modules[__name__]
+        uploaded: List[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "my-boox.conf")
+            config = load_config(config_path)
+            cache_path = resolve_cache_path(config, config_path)
+            save_cache(cache_path, {"last_seq": "1", "docs": existing_docs})
+            path = os.path.join(tmpdir, name)
+            with open(path, "w") as handle:
+                handle.write(content)
+
+            def fake_upload(cloud: Any, token: Any, filename: Any, **k: Any) -> Any:
+                uploaded.append(os.path.basename(filename))
+                item = _fake_item("new", "1-n", os.path.basename(filename), 1)
+                item["md5"] = file_md5(filename)
+                return item
+
+            with mock.patch.object(module, "with_reauth", side_effect=_run_action), \
+                 mock.patch.object(module, "refresh_cache", return_value=existing_docs), \
+                 mock.patch.object(module, "send_preamble"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "write_docs_batch"), \
+                 mock.patch.object(module, "do_delete_batch",
+                                   side_effect=lambda c, t, ids, revs, **k: (list(ids), [])), \
+                 mock.patch.object(module, "upload_one", side_effect=fake_upload), \
+                 mock.patch.object(module, "finalize_send",
+                                   side_effect=lambda c, t, item, **k: (
+                                       item["doc_id"], item["rev"], item["basename"],
+                                       item["size"], None, None)):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cmd_send(config, config_path, [path], debug=False, force=force)
+        return stdout.getvalue(), uploaded
+
+    def test_identical_file_is_not_uploaded_again(self) -> None:
+        same = hashlib.md5(b"same bytes").hexdigest()
+        out, uploaded = self._send_against(
+            {"old": {"name": "report.pdf", "size": 10, "rev": "1-o",
+                     "md5": same, "updatedAt": 1}},
+            "same bytes")
+        self.assertIn("unchanged: report.pdf", out)
+        self.assertEqual(uploaded, [])            # nothing transferred
+        self.assertNotIn("sent:", out)
+
+    def test_changed_content_is_still_sent(self) -> None:
+        stale = hashlib.md5(b"old bytes!").hexdigest()
+        out, uploaded = self._send_against(
+            {"old": {"name": "report.pdf", "size": 10, "rev": "1-o",
+                     "md5": stale, "updatedAt": 1}},
+            "new bytes!")                          # same length, different content
+        self.assertIn("sent: report.pdf", out)
+        self.assertEqual(uploaded, ["report.pdf"])
+
+    def test_force_uploads_even_an_identical_file(self) -> None:
+        same = hashlib.md5(b"same bytes").hexdigest()
+        out, uploaded = self._send_against(
+            {"old": {"name": "report.pdf", "size": 10, "rev": "1-o",
+                     "md5": same, "updatedAt": 1}},
+            "same bytes", force=True)
+        self.assertIn("sent: report.pdf", out)
+        self.assertEqual(uploaded, ["report.pdf"])
+        self.assertNotIn("unchanged", out)
+
+    def test_a_document_with_no_recorded_hash_is_re_sent_once(self) -> None:
+        out, uploaded = self._send_against(
+            {"old": {"name": "report.pdf", "size": 10, "rev": "1-o", "updatedAt": 1}},
+            "same bytes")
+        self.assertIn("sent: report.pdf", out)     # cannot prove identity -> send
+        self.assertEqual(uploaded, ["report.pdf"])
+
+    def test_refresh_keeps_the_recorded_hash(self) -> None:
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            save_cache(cache_path, {"last_seq": "0", "docs": {
+                "d1": {"name": "a.pdf", "size": 3, "rev": "1-a", "md5": "abc123"}}})
+            feed = {"last_seq": "2", "results": [
+                {"id": "d1", "changes": [{"rev": "1-a"}],
+                 "doc": {"_rev": "1-a", "name": "a.pdf", "size": 3}}]}
+            with mock.patch.object(module, "get_uid", return_value="uid1"), \
+                 mock.patch.object(module, "get_neocloud_cookie", return_value="sess"), \
+                 mock.patch.object(module, "neocloud_request", return_value=feed):
+                docs = refresh_cache("example.invalid", "tok", cache_path)
+        # the server never returns our hash; it must not be forgotten
+        self.assertEqual(docs["d1"]["md5"], "abc123")
+
+    def test_force_is_rejected_for_commands_other_than_send(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = main(["--force", "ls"])
+        self.assertEqual(rc, 201)
+        self.assertIn("only applies to 'send'", stderr.getvalue())
+
     def test_delete_rejects_an_unparseable_revision(self) -> None:
         with self.assertRaises(BooxAPIError):
             neocloud_delete_doc("example.invalid", "sess", "docid", "no-dash-here")
@@ -3444,7 +3590,7 @@ def run_self_tests(selected_group: Optional[str] = None) -> int:
 
 def print_usage(to: Any = sys.stderr) -> None:
     to.write(
-        "usage: my-boox [-D|--debug] [--config PATH] send <FILE> [FILE...]\n"
+        "usage: my-boox [-D|--debug] [--config PATH] [-f|--force] send <FILE> [FILE...]\n"
         "       my-boox [-D|--debug] [--config PATH] ls|list\n"
         "       my-boox [-D|--debug] [--config PATH] del|delete <ID> [ID...]\n"
         "       my-boox [--config [PATH]]\n"
@@ -3528,6 +3674,11 @@ new token, saves that token back to the config file, and retries the
 command once -- no separate login step to run by hand.
 
 OPTIONS
+  -f, --force        'send' only: upload even when the copy already on the
+                    device is byte-for-byte identical. Without it such a
+                    file is reported as 'unchanged' and nothing is
+                    transferred, so re-sending a whole directory only moves
+                    what actually changed. Same as force_send in the config.
   -c, --cached       'ls' only: print the local cache and make no request
                     at all. Instant, and works even if the network or the
                     managed venv is unavailable, but only as current as the
@@ -3613,11 +3764,20 @@ api_retry_delays_repeat_seconds = 3, 10
               replace   (default) upload the new copy, then remove the old
                         one. The removal happens only after the new copy is
                         registered, so a failed send never leaves you with
-                        neither.
+                        neither. A file whose content is IDENTICAL to the
+                        copy already there is reported 'unchanged' and not
+                        transferred at all, so re-sending a directory only
+                        moves what actually changed.
               keep-both upload regardless; both copies stay.
               skip      leave the device alone and do not upload.
             The older boolean duplicate_check_on_send is still read: false
             maps to keep-both.
+  force_send               -- true/false, default false. When true, 'send'
+            uploads even a byte-for-byte identical file. Same as --force.
+            Identity is decided by a content hash recorded when the file was
+            sent; the server does not keep one. A file sent by an older
+            my-boox, or via the web UI, has no recorded hash and so is
+            always re-sent once, which records it.
   send_skip_optional_calls -- true/false, default false. 'send' makes two
             calls (users/getDevice, im/getSig) whose responses are thrown
             away; they exist only because the upstream project mirrored
@@ -3709,6 +3869,7 @@ def main(argv: Sequence[str]) -> int:
     run_tests = False
     test_group = None
     cached = False
+    force = False
     rest = []
 
     i = 0
@@ -3718,6 +3879,8 @@ def main(argv: Sequence[str]) -> int:
             debug = True
         elif a in ("-c", "--cached"):
             cached = True
+        elif a in ("-f", "--force"):
+            force = True
         elif a == "--config":
             config_flag = True
             if i + 1 < len(argv) and argv[i + 1] not in KNOWN_CMDS and not argv[i + 1].startswith("-"):
@@ -3811,6 +3974,10 @@ def main(argv: Sequence[str]) -> int:
                                               DEFAULT_RETRY_DELAYS_REPEAT)
     _api_timeout = _config_float(config, "api_timeout_seconds", DEFAULT_TIMEOUT)
 
+    if force and cmd != "send":
+        sys.stderr.write(f"my-boox: --force only applies to 'send' (got '{cmd}')\n")
+        return 201
+
     if cached and cmd not in ("ls", "list"):
         sys.stderr.write(
             f"my-boox: --cached only applies to 'ls' (got '{cmd}')\n")
@@ -3826,7 +3993,7 @@ def main(argv: Sequence[str]) -> int:
             if not cmd_args:
                 sys.stderr.write("usage: my-boox send FILE [FILE...]\n")
                 return 201
-            cmd_send(config, config_path, cmd_args, debug=debug)
+            cmd_send(config, config_path, cmd_args, debug=debug, force=force)
             return 0
 
         if cmd in ("ls", "list"):

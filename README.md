@@ -178,6 +178,7 @@ api_retry_delays_seconds = 3, 5, 10
 api_retry_delays_repeat_seconds = 3, 10
 api_timeout_seconds = 30.0
 on_duplicate_name = replace
+force_send = false
 cache_path =
 ```
 
@@ -229,9 +230,26 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 
   | value | behaviour |
   | --- | --- |
-  | `replace` *(default)* | upload the new copy, then remove the old one |
+  | `replace` *(default)* | upload the new copy, then remove the old one — unless it is byte-for-byte identical, in which case nothing is transferred |
   | `keep-both` | upload regardless; both copies stay |
   | `skip` | leave the device alone, do not upload |
+
+  Under `replace`, a file identical to the copy already there is reported
+  `unchanged:` and skipped entirely, so
+
+  ```sh
+  my-boox send 0*/*.pdf
+  ```
+
+  re-sends only what actually changed. Identity is a content hash recorded
+  when the file was sent — the server keeps its `md5` field empty, so it
+  cannot tell us. Files sent by an older `my-boox` or through the web UI have
+  no recorded hash and are re-sent once, which records it. The hash survives
+  cache refreshes; deleting the cache costs one full re-send.
+
+  `--force` (or `force_send = true`) uploads regardless. Hashing only happens
+  when a candidate matches on size, so a run over unchanged files reads only
+  the files that could plausibly still match.
 
   Under `replace` the old copy is removed **only after** the new one is
   registered, so a failed send never leaves you with neither. If the removal
@@ -357,7 +375,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.6**.
+Current release: **v5.7**.
 
 ## Type checking
 
