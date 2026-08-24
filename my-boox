@@ -384,7 +384,7 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.7"
+VERSION = "5.8"
 # Fallback for --version when git isn't available (e.g. this script was
 # copied somewhere without its .git directory). Update this to the actual
 # commit right when tagging a release. When git IS available, --version

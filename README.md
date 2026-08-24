@@ -127,6 +127,63 @@ Notable fixes and discoveries along the way:
   left to diverge from. `send` still also calls `saveAndPush`, per above —
   that one, unlike the listing, is genuinely load-bearing.
 
+## Cross-check: the official Windows client
+
+The protocol above was independently confirmed against Onyx's own desktop
+client, `Send2Boox-0.2.6-win-x64.exe`, by unpacking it: NSIS installer →
+`$PLUGINSDIR/app-64.7z` → `resources/app.asar` → Vue/Vite bundles under
+`dist/assets/`. It is an Electron app (`boox-desktop` 0.2.6) using axios,
+PouchDB and Aliyun's browser OSS SDK; all sync logic lives in the
+renderer, none of it in the Electron main process.
+
+Its send path, one file at a time, strictly sequential:
+
+1. Client-side gates: storage quota (`storage_limit - storage_used`),
+   ≤200 MB per file, filename under 254 UTF-8 bytes, ≤30 files per batch.
+2. `resourceKey = <uid>/push/<uuid>.<ext>`, bucket `onyx-cloud`.
+3. `OSS.multipartUpload`, with STS credentials from `config/stss` (cached
+   300s, auto-refreshed every 10 minutes) and region/bucket from
+   `config/buckets`.
+4. `OSS.signatureUrl(key, {expires: 10000, response: {"content-disposition":
+   "attachment"}})` — that pre-signed URL is what goes into the document.
+5. Name collision check against the local PouchDB, renaming to
+   `base(1).ext`, `base(2).ext`, … on a hit.
+6. `PouchDB.put` of the message document, then
+   `replicate.to(<server>/neocloud)` — which is `_revs_diff` followed by
+   `_bulk_docs` with `new_edits=false` on the wire.
+7. `push/saveAndPush` with `{data: {name, resourceDisplayName, resourceKey,
+   bucket, resourceType, title, parent: null}, cbMsg: {id, rev}}`, the
+   `id`/`rev` being the PouchDB write's result.
+
+Every load-bearing step matches `my-boox`, `cbMsg` included. Points worth
+recording:
+
+- **`md5` is always empty.** The document model carries an `md5` field, but
+  the client never computes one, so the server does not require it.
+- **Name collisions are renamed, not replaced.** The desktop client turns a
+  second `foo.pdf` into `foo(1).pdf`; `my-boox` replaces the existing file
+  (`send` since v5.6, `--force` to override). A deliberate divergence.
+- **One file at a time.** The desktop client uploads and replicates each
+  file in its own round trip; `my-boox` puts the whole batch into a single
+  `_bulk_docs`.
+- **Re-push skips `saveAndPush`.** Re-sending an *already registered*
+  document regenerates the signed URL, bumps `updatedAt`, and does
+  `put` + `replicate.to` — no `saveAndPush`. It is still called for every
+  genuinely new file, so `saveAndPush` is a one-time registration per
+  document, not a per-delivery trigger. `my-boox` has no re-push command;
+  if one is ever added, this is the sequence it should follow.
+- **Auth**: `Authorization: Bearer <token>` on `api/1/*`; the
+  `users/syncToken` cookie scoped to `/neocloud` — same split `my-boox`
+  uses.
+- **Server discovery**: `index1..5.send2boox.com` (zh locale) or
+  `index1..5.boox.com` (elsewhere), `/api/1/serverInfos`, first responder
+  wins and is cached.
+
+The desktop client also has a second, entirely separate LAN path: a
+WebSocket at `wss://<server>/share/<uid>` announces devices on the local
+network, and picking one just opens the device's own on-board web uploader
+in an iframe. No cloud, no `/neocloud/`, nothing `my-boox` shares with it.
+
 ## Install
 
 Just download the script and make it executable — there's nothing else to
@@ -375,7 +432,7 @@ Prints the version and the git commit it's actually running from (with a
 live commit from the repo on disk; falls back to a baked-in placeholder
 only if this copy was moved somewhere without its `.git` directory.
 
-Current release: **v5.7**.
+Current release: **v5.8**.
 
 ## Type checking
 
