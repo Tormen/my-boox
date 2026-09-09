@@ -210,8 +210,12 @@ CONFIG_NAME = "my-boox.conf"
 # Note the home entry is dot-prefixed and the others are not -- that is the
 # convention these my-* tools follow, so the search is over full paths
 # rather than a single filename joined onto a list of directories.
+# Under /LINKS/default both spellings are accepted -- the site's config
+# farm holds some names with a .conf suffix and some without; a tool that
+# knows only one of them ignores a config sitting right there.
 CONFIG_SEARCH_PATHS = [
     os.path.join("/LINKS/default", CONFIG_NAME),
+    os.path.join("/LINKS/default", CONFIG_NAME.removesuffix(".conf")),
     os.path.join(os.path.expanduser("~"), "." + CONFIG_NAME),
     os.path.join("/etc", CONFIG_NAME),
     os.path.join("/usr/local/etc", CONFIG_NAME),
