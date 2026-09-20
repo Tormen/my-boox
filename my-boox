@@ -388,33 +388,134 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
         return default
 
 
-VERSION = "5.8"
-# Fallback for --version when git isn't available (e.g. this script was
-# copied somewhere without its .git directory). Update this to the actual
-# commit right when tagging a release. When git IS available, --version
-# prefers the live commit hash instead, so this only matters as a fallback.
-GIT_COMMIT_FALLBACK = "unknown"
+# VERSION names the release these bytes are BASED on -- only a release commit
+# sets it.  SCRIPT_COMMIT is the commit this file was released from and
+# SCRIPT_RELEASE what `git describe --tags --long` said then (<nearest
+# tag>-<commits since it>-g<short sha>); both are written when tagging a
+# release, so a copy without its .git can still say what it is.
+VERSION = "v3.1"
+SCRIPT_COMMIT = "2b4e77a"
+SCRIPT_RELEASE = "v3.1-16-g2b4e77a"
 
 
-def _get_git_commit() -> Optional[str]:
+def _script_build_id() -> str:
+    """First 12 hex of this file's own SHA-256: the value that identifies the
+    bytes, so two installs are compared by running --version on each."""
+    import hashlib
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def _script_describe() -> str:
+    """git's own `describe --tags --long`, else the stamped value.  Git first:
+    in a checkout it is exact at every moment, while the stamp is written
+    BEFORE the release is tagged and so lags one release step.  A copy without
+    a .git beside it has only the stamp."""
     script_dir = os.path.dirname(os.path.realpath(__file__))
     try:
-        result = subprocess.run(
-            ["git", "-C", script_dir, "rev-parse", "--short", "HEAD"],
+        r = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", script_dir,
+             "describe", "--tags", "--long"],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode != 0:
-            return None
-        commit = result.stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", script_dir, "status", "--porcelain"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if dirty.returncode == 0 and dirty.stdout.strip():
-            commit += "-dirty"
-        return commit
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return None
+        pass
+    return SCRIPT_RELEASE
+
+
+def _stamp_version() -> int:
+    """Record HEAD and git's describe string in this file, then AMEND the
+    commit they belong to, so the released bytes carry them.  Run it after
+    committing and BEFORE pushing -- the amend rewrites the commit -- and tag
+    afterwards, or the tag lands on the commit the amend replaced.  The
+    stamped sha lags HEAD by one: a commit cannot contain its own sha."""
+    import re as _re
+    import shutil
+    import tempfile
+    self_path = os.path.realpath(__file__)
+    here = os.path.dirname(self_path)
+
+    def git(*a: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(["git", "-C", here, *a], capture_output=True, text=True)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        print("--stamp-version: not a git checkout -- nothing to stamp.", file=sys.stderr)
+        return 1
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    if not sha:
+        print("--stamp-version: no commit to stamp from.", file=sys.stderr)
+        return 1
+    if (git("rev-parse", "--abbrev-ref", "@{upstream}").returncode == 0
+            and git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0):
+        print("--stamp-version: HEAD is already pushed -- amending it would rewrite "
+              "published history. Commit, stamp, THEN push.", file=sys.stderr)
+        return 1
+    staged = git("diff", "--cached", "--name-only").stdout.split()
+    if staged:
+        print("--stamp-version: something is staged -- the amend would fold it in: "
+              f"{' '.join(staged)}", file=sys.stderr)
+        return 1
+    rel = os.path.basename(self_path)
+    if git("diff", "--quiet", "--", rel).returncode != 0:
+        print("--stamp-version: this script has uncommitted edits -- commit them first.",
+              file=sys.stderr)
+        return 1
+
+    desc = git("describe", "--tags", "--long").stdout.strip()
+    with open(self_path) as f:
+        src = f.read()
+    new_src, n1 = _re.subn(r'^SCRIPT_COMMIT\s*=.*$', f'SCRIPT_COMMIT = "{sha}"',
+                           src, count=1, flags=_re.MULTILINE)
+    new_src, n2 = _re.subn(r'^SCRIPT_RELEASE\s*=.*$', f'SCRIPT_RELEASE = "{desc}"',
+                           new_src, count=1, flags=_re.MULTILINE)
+    if n1 != 1 or n2 != 1:
+        print("--stamp-version: could not find the stamp lines.", file=sys.stderr)
+        return 1
+    fd, tmp = tempfile.mkstemp(dir=here, prefix=".my-boox.stamp.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_src)
+        shutil.copymode(self_path, tmp)
+        os.replace(tmp, self_path)
+    except OSError as e:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        print(f"--stamp-version: could not install the stamped file: {e}", file=sys.stderr)
+        return 1
+    if git("add", "--", rel).returncode != 0 or git("commit", "--amend", "--no-edit").returncode != 0:
+        print("--stamp-version: git add/amend failed.", file=sys.stderr)
+        return 1
+    print(f"stamped SCRIPT_COMMIT={sha} SCRIPT_RELEASE={desc or '<no tag yet>'} -- "
+          f"HEAD is now {git('rev-parse', '--short', 'HEAD').stdout.strip()}")
+    return 0
+
+
+def _script_version_string() -> str:
+    """What these bytes are: the release they are based on, whether they ARE
+    it, and the id of the bytes themselves.
+
+        my-boox v3.1 (v3.1-0-g29bc91c: the v3.1 tag, build 1a2b3c4d5e6f)
+        my-boox v3.1+15 (v3.1-15-g29bc91c: 15 commit(s) past v3.1, unreleased,
+                         build 1a2b3c4d5e6f)
+    """
+    build = _script_build_id()
+    desc = _script_describe()
+    head, _sep, sha = desc.rpartition("-g")
+    tag, _sep2, count = head.rpartition("-")
+    if sha and tag and count.isdigit():
+        n = int(count)
+        if n == 0:
+            return f"my-boox {VERSION} ({desc}: the {tag} tag, build {build})"
+        return (f"my-boox {VERSION}+{n} ({desc}: {n} commit(s) past {tag}, "
+                f"unreleased, build {build})")
+    if SCRIPT_COMMIT:
+        return f"my-boox {VERSION} (commit {SCRIPT_COMMIT}, build {build})"
+    return f"my-boox {VERSION} (build {build}, unstamped)"
 
 
 class BooxAuthError(Exception):
@@ -3913,9 +4014,10 @@ def main(argv: Sequence[str]) -> int:
             print_help(sys.stdout)
             return 0
         elif a in ("-V", "--version"):
-            commit = _get_git_commit() or GIT_COMMIT_FALLBACK
-            print(f"my-boox {VERSION} (commit {commit})")
+            print(_script_version_string())
             return 0
+        elif a == "--stamp-version":
+            return _stamp_version()
         else:
             rest.append(a)
         i += 1
