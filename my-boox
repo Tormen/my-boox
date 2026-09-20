@@ -394,8 +394,8 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
 # tag>-<commits since it>-g<short sha>); both are written when tagging a
 # release, so a copy without its .git can still say what it is.
 VERSION = "v3.1"
-SCRIPT_COMMIT = "2b4e77a"
-SCRIPT_RELEASE = "v3.1-16-g2b4e77a"
+SCRIPT_COMMIT = "268aae5"
+SCRIPT_RELEASE = "v3.1-17-g268aae5"
 
 
 def _script_build_id() -> str:
@@ -422,7 +422,20 @@ def _script_describe() -> str:
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            desc = r.stdout.strip()
+            # describe answers about WHERE this file sits, not about what it
+            # is: a copy dropped in a foreign repo gets THAT repo's tags
+            # (/LINKS/global is one, and it holds the copies update-LINKS
+            # promotes).  The stamped commit is the proof -- a repo that does
+            # not have it is not this tool's repo.
+            if SCRIPT_COMMIT:
+                own = subprocess.run(
+                    ["git", "-c", "safe.directory=*", "-C", script_dir,
+                     "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
+                    capture_output=True, text=True, timeout=5)
+                if own.returncode != 0:
+                    return SCRIPT_RELEASE
+            return desc
     except (OSError, subprocess.SubprocessError):
         pass
     return SCRIPT_RELEASE
