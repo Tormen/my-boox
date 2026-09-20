@@ -394,8 +394,8 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
 # tag>-<commits since it>-g<short sha>); both are written when tagging a
 # release, so a copy without its .git can still say what it is.
 VERSION = "v3.1"
-SCRIPT_COMMIT = "268aae5"
-SCRIPT_RELEASE = "v3.1-17-g268aae5"
+SCRIPT_COMMIT = "54893b5"
+SCRIPT_RELEASE = "v3.1-18-g54893b5"
 
 
 def _script_build_id() -> str:
@@ -434,11 +434,14 @@ def _script_describe() -> str:
                      "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
                     capture_output=True, text=True, timeout=5)
                 if own.returncode != 0:
-                    return SCRIPT_RELEASE
+                    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
             return desc
     except (OSError, subprocess.SubprocessError):
         pass
-    return SCRIPT_RELEASE
+    # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is
+    # no stamp to fall back to, and a lone SCRIPT_RELEASE would be a release
+    # claim nothing backs -- an unstamped file says so.
+    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
 
 
 def _stamp_version() -> int:
