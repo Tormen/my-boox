@@ -394,8 +394,8 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
 # tag>-<commits since it>-g<short sha>); both are written when tagging a
 # release, so a copy without its .git can still say what it is.
 VERSION = "v3.1"
-SCRIPT_COMMIT = "54893b5"
-SCRIPT_RELEASE = "v3.1-18-g54893b5"
+SCRIPT_COMMIT = "42540e7"
+SCRIPT_RELEASE = "v3.1-19-g42540e7"
 
 
 def _script_build_id() -> str:
@@ -470,6 +470,15 @@ def _stamp_version() -> int:
             and git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0):
         print("--stamp-version: HEAD is already pushed -- amending it would rewrite "
               "published history. Commit, stamp, THEN push.", file=sys.stderr)
+        return 1
+    # The repo may be SHARED -- other sessions commit here too -- and an amend
+    # rewrites whatever HEAD happens to be.  Stamp only the commit that
+    # carries THIS file: if HEAD does not touch it, HEAD is someone else's.
+    if not git("show", "--name-only", "--format=", "HEAD", "--",
+               os.path.basename(self_path)).stdout.strip():
+        print("--stamp-version: HEAD does not touch this file -- it is not this file's "
+              "commit (commit it first; in a shared repo the amend would rewrite "
+              "someone else's).", file=sys.stderr)
         return 1
     staged = git("diff", "--cached", "--name-only").stdout.split()
     if staged:
