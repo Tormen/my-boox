@@ -721,10 +721,11 @@ def save_cache(cache_path: str, cache: Cache) -> None:
 
 # Response and request fields that are credentials in their own right.
 # 'code' is the emailed verification code, 'token'/'session_id' are the two
-# things that authenticate every call this tool makes, and the STS triple
-# is a live write capability on the OSS bucket.
+# things that authenticate every call this tool makes, the STS triple
+# is a live write capability on the OSS bucket, and 'sig' is the signature
+# im/getSig issues for Onyx's messaging service.
 _SECRET_KEYS = frozenset({
-    "token", "session_id", "code", "sign", "userSig",
+    "token", "session_id", "code", "sign", "sig", "userSig",
     "AccessKeyId", "AccessKeySecret", "SecurityToken",
 })
 
@@ -2641,7 +2642,9 @@ class TestRegressions(unittest.TestCase):
             "result_code": 0,
             "data": {"session_id": "6f798b02cede2dda45a6f3fe343be49a65f0e320",
                      "token": "live-account-token",
-                     "AccessKeySecret": "sts-secret"},
+                     "AccessKeySecret": "sts-secret",
+                     # im/getSig's reply, exactly as it arrives on every send
+                     "sig": "eJw1jcsKwjAURP8lW6W9SROTFFxUQRHqyoLQXUlSudRKbOsb"},
         }
         stub = _FakeRequests([_FakeResponse(200, payload)])
         stderr = io.StringIO()
@@ -2652,7 +2655,8 @@ class TestRegressions(unittest.TestCase):
 
         out = stderr.getvalue()
         for secret in ("6f798b02cede2dda45a6f3fe343be49a65f0e320",
-                       "live-account-token", "sts-secret", "123456"):
+                       "live-account-token", "sts-secret", "123456",
+                       "eJw1jcsKwjAURP8lW6W9SROTFFxUQRHqyoLQXUlSudRKbOsb"):
             self.assertNotIn(secret, out)
         self.assertIn("redacted", out)
         self.assertIn("users/syncToken", out)  # still useful for debugging
