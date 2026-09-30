@@ -394,8 +394,8 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
 # tag>-<commits since it>-g<short sha>); both are written when tagging a
 # release, so a copy without its .git can still say what it is.
 VERSION = "v3.1"
-SCRIPT_COMMIT = "42540e7"
-SCRIPT_RELEASE = "v3.1-19-g42540e7"
+SCRIPT_COMMIT = "7d8f910"
+SCRIPT_RELEASE = "v3.1-24-g7d8f910"
 
 
 def _script_build_id() -> str:
@@ -2445,7 +2445,13 @@ class TestRegressions(unittest.TestCase):
 
             self.assertEqual([g["name"] for g in groups[:2]],
                              ["new.pdf", "old.pdf"])  # newest first, no crash
-            self.assertIn("1,024", stdout.getvalue().replace(" ", ","))
+            # The string size was parsed as a number. Whether it prints as
+            # 1024 or 1,024 (or with any other separator) is the locale's call;
+            # the C locale groups nothing, so the test must not depend on it.
+            old_row = [line for line in stdout.getvalue().splitlines()
+                       if line.endswith("| old.pdf")]
+            self.assertEqual(len(old_row), 1)
+            self.assertRegex(old_row[0], r"\| +1\D?024 \|")
 
     # -- a server-side "42" and a local getsize() 42 must be one file, not
     #    two rows and a duplicate upload.
@@ -2815,6 +2821,7 @@ class TestRegressions(unittest.TestCase):
         home = os.path.expanduser("~")
         self.assertEqual(CONFIG_SEARCH_PATHS, [
             "/LINKS/default/my-boox.conf",
+            "/LINKS/default/my-boox",
             os.path.join(home, ".my-boox.conf"),
             "/etc/my-boox.conf",
             "/usr/local/etc/my-boox.conf",
