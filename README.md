@@ -143,7 +143,9 @@ Its send path, one file at a time, strictly sequential:
 2. `resourceKey = <uid>/push/<uuid>.<ext>`, bucket `onyx-cloud`.
 3. `OSS.multipartUpload`, with STS credentials from `config/stss` (cached
    300s, auto-refreshed every 10 minutes) and region/bucket from
-   `config/buckets`.
+   `config/buckets`. my-boox uses a single PUT instead (any size up to
+   5 GB): the STS policy denies `ListParts`, which oss2's resumable
+   multipart upload calls for every file over 10 MB.
 4. `OSS.signatureUrl(key, {expires: 10000, response: {"content-disposition":
    "attachment"}})` — that pre-signed URL is what goes into the document.
 5. Name collision check against the local PouchDB, renaming to

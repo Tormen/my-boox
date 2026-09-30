@@ -1469,7 +1469,11 @@ def upload_one(cloud: str, token: Optional[str], filename: str,
 
     _, extension = os.path.splitext(filename)
     remotename = f"{uid}/push/{uuid.uuid4()}{extension}"
-    oss2.resumable_upload(bucket, remotename, filename)
+    # One PUT, whatever the size (OSS takes up to 5GB that way). Not
+    # oss2.resumable_upload: above 10MB it goes multipart and then lists
+    # the parts already uploaded -- even for a fresh upload -- and the STS
+    # policy denies ListParts, so every large file failed with AccessDenied.
+    bucket.put_object_from_file(remotename, filename)
 
     basename = os.path.basename(filename)
     resource_type = extension.lstrip(".").lower() or "txt"
@@ -3001,6 +3005,19 @@ class TestRegressions(unittest.TestCase):
 
         endpoint = oss_stub.Bucket.call_args[0][1]
         self.assertEqual(endpoint, "https://oss-us-west-1.aliyuncs.com")
+
+        # -- files over 10MB failed with "Access denied by authorizer's
+        #    policy": oss2.resumable_upload goes multipart there and calls
+        #    ListParts, which the STS policy does not allow. A single PUT is
+        #    what the policy grants, at any size.
+        oss_stub.resumable_upload.assert_not_called()
+        bucket = oss_stub.Bucket.return_value
+        bucket.put_object_from_file.assert_called_once()
+        key, path = bucket.put_object_from_file.call_args[0]
+        self.assertTrue(key.startswith("uid1/push/") and key.endswith(".txt"))
+        self.assertEqual(path, sample)
+        bucket.list_parts.assert_not_called()
+        bucket.init_multipart_upload.assert_not_called()
 
     def test_delete_of_a_missing_document_skips_batchdelete(self) -> None:
         module = sys.modules[__name__]
