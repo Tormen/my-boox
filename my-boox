@@ -75,6 +75,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import TracebackType
 from typing import (Any, Callable, Dict, List, NoReturn, Optional,
                     Sequence, Tuple)
 from unittest import mock
@@ -3717,15 +3718,81 @@ class TestRegressions(unittest.TestCase):
             neocloud_delete_doc("example.invalid", "sess", "docid", "no-dash-here")
 
 
+_ExcInfo = Tuple[Optional[type], Optional[BaseException], Optional[TracebackType]]
+
+
+class _TapResult(unittest.TextTestResult):
+    """Prints `ok K - name` / `not ok K - name` on stdout as each test ends,
+    numbered in suite order, after the plan `1..N` that run_self_tests prints
+    first. A caller reading the merged stdout+stderr live (my-rollout's
+    progress bar) counts these lines; unittest's own report (tracebacks,
+    `Ran N tests`, OK/FAILED) still goes to stderr as before."""
+
+    def __init__(self, stream: Any, descriptions: bool, verbosity: int) -> None:
+        super().__init__(stream, descriptions, verbosity)
+        self._tap_n = 0
+        self._tap_failed = False
+        self._tap_skip: Optional[str] = None
+
+    def startTest(self, test: unittest.TestCase) -> None:
+        self._tap_failed = False
+        self._tap_skip = None
+        super().startTest(test)
+
+    def addFailure(self, test: unittest.TestCase, err: _ExcInfo) -> None:
+        self._tap_failed = True
+        super().addFailure(test, err)  # pyright: ignore[reportArgumentType]  # typeshed's exc-info alias is private
+
+    def addError(self, test: unittest.TestCase, err: _ExcInfo) -> None:
+        self._tap_failed = True
+        super().addError(test, err)  # pyright: ignore[reportArgumentType]  # typeshed's exc-info alias is private
+
+    def addSubTest(self, test: unittest.TestCase, subtest: unittest.TestCase,
+                   err: Optional[_ExcInfo]) -> None:
+        if err is not None:
+            self._tap_failed = True
+        super().addSubTest(test, subtest, err)  # pyright: ignore[reportArgumentType]  # same private alias
+
+    def addUnexpectedSuccess(self, test: unittest.TestCase) -> None:
+        self._tap_failed = True  # wasSuccessful() counts it as a failure too
+        super().addUnexpectedSuccess(test)
+
+    def addSkip(self, test: unittest.TestCase, reason: str) -> None:
+        self._tap_skip = reason
+        super().addSkip(test, reason)
+
+    def stopTest(self, test: unittest.TestCase) -> None:
+        super().stopTest(test)
+        self._tap_n += 1
+        name = test.id()
+        if name.startswith("__main__."):
+            name = name[len("__main__."):]
+        line = f"{'not ok' if self._tap_failed else 'ok'} {self._tap_n} - {name}"
+        if self._tap_skip is not None:
+            line += f" # SKIP {self._tap_skip}"
+        sys.stderr.flush()
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
 def run_self_tests(selected_group: Optional[str] = None) -> int:
-    groups = {
+    groups: Dict[str, List[type]] = {
         "smoke": [TestCliBehavior],
         "core": [TestConfigHandling, TestCacheAndGrouping],
         "commands": [TestCommandHandlers],
         "regressions": [TestRegressions],
-        "all": [TestCliBehavior, TestConfigHandling, TestCacheAndGrouping,
-                TestCommandHandlers, TestRegressions],
     }
+    groups["all"] = [case for cases in groups.values() for case in cases]
+
+    # The groups are a hand-written list, so a new TestCase class would
+    # otherwise run in no group at all -- not even 'all' -- without a word.
+    grouped = set(groups["all"])
+    orphans = sorted(name for name, obj in globals().items()
+                     if isinstance(obj, type) and issubclass(obj, unittest.TestCase)
+                     and obj.__module__ == __name__ and obj not in grouped)
+    if orphans:
+        sys.stderr.write(f"my-boox: test class(es) in no --run-tests group: {', '.join(orphans)}\n")
+        return 1
 
     group = (selected_group or "all").strip().lower()
     if group not in groups:
@@ -3738,7 +3805,13 @@ def run_self_tests(selected_group: Optional[str] = None) -> int:
     for case in groups[group]:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
 
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    # The plan comes first, before any other output, so a reader knows N
+    # before the first `ok` line arrives.
+    sys.stdout.write(f"1..{suite.countTestCases()}\n")
+    sys.stdout.flush()
+    # verbosity 0: the per-test `ok K - name` lines replace unittest's
+    # `test_x (...) ... ok` ones; failures are still printed in full below.
+    result = unittest.TextTestRunner(verbosity=0, resultclass=_TapResult).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
