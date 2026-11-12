@@ -338,14 +338,30 @@ and go through the re-auth prompt. `cloud` is your BOOXDrop server region
 `my-boox` looks for its config in this order:
 
 0. `$MY_BOOX_CONFIG`, if set and non-empty — wins outright
-1. `/LINKS/default/my-boox.conf`
+1. `<CONFIG_SEARCH_DIR>/my-boox.conf`, then `<CONFIG_SEARCH_DIR>/my-boox` —
+   only when the site file names a `CONFIG_SEARCH_DIR` (see below)
 2. `~/.my-boox.conf` — **dot-prefixed**, home only
 3. `/etc/my-boox.conf`
 4. `/usr/local/etc/my-boox.conf`
 
-First match wins; running a command with no config anywhere exits `206`.
-A `--config PATH` naming a file that doesn't exist also exits `206` rather
-than silently falling back to the search.
+First match wins; running a command with no config anywhere exits `206` and
+offers the places to write one, most common first. A `--config PATH` naming
+a file that doesn't exist also exits `206` rather than silently falling back
+to the search.
+
+### Site file
+
+`/LINKS/default/site.conf`, when it exists, is read before the config. It
+holds plain `KEY="value"` lines — parsed, never run — shared by every tool
+of a site. `my-boox` uses three of them:
+
+- `CONFIG_SEARCH_DIR` — searched first, as above
+- `CONFIG_OFFER_DIR` — offered first when no config is found, with
+  `CONFIG_OFFER_NOTE` beside it (only while `CONFIG_SEARCH_DIR` is searched)
+
+Without the file, both steps are skipped. A file that is there but
+unreadable, or holds anything but plain `KEY="value"` lines, exits `207`.
+Environment variables of these names are never read.
 
 The config stores your account `token`, which is a full credential — anything
 that can read the file can send to and delete from your device. `my-boox`
@@ -466,6 +482,7 @@ strict's default and reports zero.
 | 204 | action failed even after re-auth retry, or a file failed to upload |
 | 205 | re-auth step itself failed (no email configured, no code entered, stdin not a terminal, or the request-code/obtain-token call failed) |
 | 206 | no config file found, or the `--config PATH` given does not exist |
+| 207 | `/LINKS/default/site.conf` is there but unreadable, or holds a line that is not a plain `KEY="value"` |
 | 130 | interrupted with Ctrl-C |
 
 ## License

@@ -46,9 +46,10 @@ Usage:
   my-boox [--config [PATH]]         # print resolved config path and exit
   my-boox [--create-config [PATH]]  # print (or write) a template config
 
-Config search order (first match wins): $MY_BOOX_CONFIG -> /LINKS/default/
--> ~/.my-boox.conf -> /etc/ -> /usr/local/etc/, filename my-boox.conf
-(dot-prefixed in home only). The file is
+Config search order (first match wins): $MY_BOOX_CONFIG -> the site's
+CONFIG_SEARCH_DIR (from /LINKS/default/site.conf, when there; my-boox.conf,
+then the bare my-boox) -> ~/.my-boox.conf -> /etc/ -> /usr/local/etc/,
+filename my-boox.conf (dot-prefixed in home only). The file is
 written 0600 because it stores the account token. Config format:
 
   [default]
@@ -64,6 +65,8 @@ err codes:
   205  re-auth step itself failed (no email configured / no code entered /
        stdin not a terminal / request-code or obtain-token call failed)
   206  no config file found, or the --config PATH given does not exist
+  207  /LINKS/default/site.conf is there but unreadable, or holds a line
+       that is not a plain KEY="value"
   130  interrupted with Ctrl-C
 """
 
@@ -205,23 +208,14 @@ import locale
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 
 DEFAULT_CLOUD = "eur.boox.com"
 CONFIG_NAME = "my-boox.conf"
-# Note the home entry is dot-prefixed and the others are not -- that is the
-# convention these my-* tools follow, so the search is over full paths
-# rather than a single filename joined onto a list of directories.
-# Under /LINKS/default both spellings are accepted -- the site's config
-# farm holds some names with a .conf suffix and some without; a tool that
-# knows only one of them ignores a config sitting right there.
-CONFIG_SEARCH_PATHS = [
-    os.path.join("/LINKS/default", CONFIG_NAME),
-    os.path.join("/LINKS/default", CONFIG_NAME.removesuffix(".conf")),
-    os.path.join(os.path.expanduser("~"), "." + CONFIG_NAME),
-    os.path.join("/etc", CONFIG_NAME),
-    os.path.join("/usr/local/etc", CONFIG_NAME),
-]
 CONFIG_ENV_VAR = "MY_BOOX_CONFIG"
+# The one site-specific path in this tool: the site's settings for every
+# tool, read by read_site. Tests point it at a file of their own.
+SITE_CONF = "/LINKS/default/site.conf"
 # The browser asks for _changes with limit=1000; we asked for an unbounded
 # feed, which makes the server do more work per request -- and an
 # unboundedly slow _changes is exactly what the gateway times out on.
@@ -395,8 +389,8 @@ def _config_bool(config: configparser.ConfigParser, key: str, default: bool) -> 
 # tag>-<commits since it>-g<short sha>); both are written when tagging a
 # release, so a copy without its .git can still say what it is.
 VERSION = "v3.1"
-SCRIPT_COMMIT = "7d8f910"
-SCRIPT_RELEASE = "v3.1-24-g7d8f910"
+SCRIPT_COMMIT = "a2d16db"
+SCRIPT_RELEASE = "v3.1-26-ga2d16db"
 
 
 def _script_build_id() -> str:
@@ -568,6 +562,94 @@ class BooxSessionExpired(BooxAPIError):
 # Config handling
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Site:
+    """The site's config search and offer, from SITE_CONF; without that file
+    the neutral values: no search directory, nothing offered there. (my-boox
+    keeps no state under the site's base directories: its cache sits beside
+    its config, see cache_path_for.)"""
+    config_search_dir: str = ""
+    config_offer_dir: str = ""
+    config_offer_note: str = ""
+
+
+# KEY="value", KEY='value' or a bare KEY=value, optionally a trailing comment.
+_SITE_LINE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s"'#]*)(?:\s+#.*)?""")
+
+
+def read_site() -> Site:
+    """SITE_CONF, read before the config: plain KEY="value" lines, parsed
+    and never run -- a $ or a backtick in one is refused (207). Not there:
+    the neutral values. There but unreadable: 207, because falling back
+    would quietly make this user search elsewhere than everyone else. Never
+    the environment: cron, sudo and a login shell each see different ones."""
+    try:
+        with open(SITE_CONF, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return Site()
+    except OSError as e:
+        die(f"my-boox: cannot read {SITE_CONF} ({e.strerror}) -- "
+            f"the site's settings for every tool", 207)
+    values: Dict[str, str] = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _SITE_LINE.fullmatch(s)
+        if m is None or "$" in s or "`" in s:
+            die(f"my-boox: {SITE_CONF}:{n}: not a plain KEY=\"value\" line "
+                f"-- the site file is parsed, never run: {s[:60]}", 207)
+        raw = m.group(2)
+        values[m.group(1)] = raw[1:-1] if raw[:1] in ("\"", "'") else raw
+    return Site(config_search_dir=values.get("CONFIG_SEARCH_DIR", ""),
+                config_offer_dir=values.get("CONFIG_OFFER_DIR", ""),
+                config_offer_note=values.get("CONFIG_OFFER_NOTE", ""))
+
+
+def _home_config() -> str:
+    """~/.my-boox.conf: dot-prefixed in home only, as the my-* tools do."""
+    return os.path.join(os.path.expanduser("~"), "." + CONFIG_NAME)
+
+
+def config_search_paths(site: Site) -> List[str]:
+    """Where the config is looked for after $MY_BOOX_CONFIG, first existing
+    wins: the site's search directory under both names -- it holds some
+    configs with the .conf suffix and some without -- then ~, /etc and
+    /usr/local/etc."""
+    near = ([os.path.join(site.config_search_dir, CONFIG_NAME),
+             os.path.join(site.config_search_dir, CONFIG_NAME.removesuffix(".conf"))]
+            if site.config_search_dir else [])
+    return near + [_home_config(), os.path.join("/etc", CONFIG_NAME),
+                   os.path.join("/usr/local/etc", CONFIG_NAME)]
+
+
+def config_offer(site: Site) -> List[Tuple[str, str]]:
+    """Where to write a config, most common place first, each with its note:
+    the site's offer directory -- only while the site's search directory is
+    searched, which a file there reaches as the note says, and never that
+    search directory itself, which is generated -- then /etc and ~, each
+    only when searched."""
+    offer: List[Tuple[str, str]] = []
+    if (site.config_offer_dir and site.config_search_dir
+            and os.path.normpath(site.config_offer_dir) != os.path.normpath(site.config_search_dir)):
+        offer.append((os.path.join(site.config_offer_dir, CONFIG_NAME), site.config_offer_note))
+    searched = config_search_paths(site)
+    return offer + [(p, "") for p in (os.path.join("/etc", CONFIG_NAME), _home_config())
+                    if p in searched]
+
+
+def no_config_offer(site: Site) -> str:
+    """The 206 message: each offered place as a paste-ready line, the
+    site's note beside its own. --create-config PATH, not a redirect: it
+    writes the file 0600, and the file will hold the account token."""
+    lines = "".join(f"    > my-boox --create-config {p}" + (f"   ({note})" if note else "") + "\n"
+                    for p, note in config_offer(site))
+    return (f"my-boox: no config found (and ${CONFIG_ENV_VAR} is unset) -- "
+            f"write one, most common place first:\n{lines}"
+            f"    (my-boox --help lists every place it is looked for)")
+
+
 def resolve_config_path(required: bool = False) -> str:
     """$MY_BOOX_CONFIG wins outright (the escape hatch for tests and cron),
     otherwise the first existing file in the documented search order."""
@@ -586,17 +668,14 @@ def resolve_config_path(required: bool = False) -> str:
             )
         return env_path
 
-    for p in CONFIG_SEARCH_PATHS:
+    site = read_site()
+    searched = config_search_paths(site)
+    for p in searched:
         if os.path.isfile(p):
             return p
     if required:
-        die(
-            "my-boox: no config found. Searched: " + ", ".join(CONFIG_SEARCH_PATHS) +
-            f" (and ${CONFIG_ENV_VAR} is unset)"
-            f" -- run 'my-boox --create-config ~/.{CONFIG_NAME}' to create one",
-            206,
-        )
-    return CONFIG_SEARCH_PATHS[0]
+        die(no_config_offer(site), 206)
+    return searched[0]
 
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -2167,6 +2246,84 @@ class TestConfigHandling(unittest.TestCase):
             reloaded = load_config(config_path)
             self.assertEqual(reloaded["default"]["cloud"], DEFAULT_CLOUD)
 
+    def test_site_conf_gives_the_search_and_the_offer(self) -> None:
+        """The site file's values when it is there, the neutral ones when it
+        is not -- an exported variable never in their place; 207 when it is
+        there but unreadable or not plain KEY="value" lines. The search reads
+        the site's search directory first, the bare name too; the offer names
+        the site's offer directory with its note, never the search directory."""
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site_file = os.path.join(tmpdir, "site.conf")
+            farm = os.path.join(tmpdir, "farm")
+            home_conf = os.path.join(tmpdir, ".my-boox.conf")
+            env = {"CONFIG_SEARCH_DIR": "/exported", "CONFIG_OFFER_DIR": "/exported",
+                   "HOME": tmpdir, CONFIG_ENV_VAR: ""}
+            with mock.patch.object(module, "SITE_CONF", site_file), \
+                 mock.patch.dict(os.environ, env):
+                self.assertEqual(read_site(), Site())
+                self.assertEqual(config_search_paths(read_site())[0], home_conf)
+
+                os.mkdir(farm)
+                with open(site_file, "w") as handle:
+                    handle.write(f'# the site\nDATA_BASE_DIR="/srv/data"\n'
+                                 f'CONFIG_SEARCH_DIR="{farm}"\n'
+                                 f"CONFIG_OFFER_DIR='{tmpdir}/global'\n"
+                                 f'CONFIG_OFFER_NOTE="linked there by a run"\n')
+                with open(os.path.join(farm, "my-boox"), "w") as handle:
+                    handle.write("[default]\n")
+                self.assertEqual(resolve_config_path(required=True),
+                                 os.path.join(farm, "my-boox"))
+
+                offer = no_config_offer(read_site())
+                self.assertNotIn(farm + os.sep, offer)
+                self.assertIn(
+                    f"    > my-boox --create-config {tmpdir}/global/my-boox.conf"
+                    f"   (linked there by a run)\n"
+                    f"    > my-boox --create-config /etc/my-boox.conf\n"
+                    f"    > my-boox --create-config {home_conf}\n", offer)
+
+                bad = ['CONFIG_SEARCH_DIR="$HOME/x"\n', "CONFIG_SEARCH_DIR=`pwd`\n",
+                       "CONFIG_SEARCH_DIR /x\n"]
+                for text in bad:
+                    with open(site_file, "w") as handle:
+                        handle.write(text)
+                    with contextlib.redirect_stderr(io.StringIO()) as err, \
+                         self.assertRaises(SystemExit) as ctx:
+                        read_site()
+                    self.assertEqual(ctx.exception.code, 207, text)
+                    self.assertIn(f"{site_file}:1:", err.getvalue())
+
+                if os.geteuid() != 0:   # root reads a mode-0 file all the same
+                    with open(site_file, "w") as handle:
+                        handle.write('CONFIG_SEARCH_DIR="/x"\n')
+                    os.chmod(site_file, 0)
+                    with contextlib.redirect_stderr(io.StringIO()) as err, \
+                         self.assertRaises(SystemExit) as ctx:
+                        read_site()
+                    self.assertEqual(ctx.exception.code, 207)
+                    self.assertIn(f"cannot read {site_file}", err.getvalue())
+
+    def test_config_offer_names_only_searched_paths(self) -> None:
+        """Every offered path is searched, or is the site's offer directory
+        while the site's search directory is searched; that search directory
+        is never offered -- not even when the offer directory is the same."""
+        farm, glob = "/site/farm", "/site/global"
+        for site in (Site(config_search_dir=farm, config_offer_dir=glob),
+                     Site(config_offer_dir=glob),
+                     Site(config_search_dir=farm, config_offer_dir=farm + "/"),
+                     Site()):
+            searched = config_search_paths(site)
+            for path, _note in config_offer(site):
+                self.assertFalse(path.startswith(farm), f"offered the farm: {path} ({site})")
+                if path.startswith(glob):
+                    self.assertIn(os.path.join(farm, "my-boox.conf"), searched,
+                                  f"offered {path}, its farm not searched ({site})")
+                else:
+                    self.assertIn(path, searched, f"offered but not searched: {path} ({site})")
+        first = config_offer(Site(config_search_dir=farm, config_offer_dir=glob))[0][0]
+        self.assertEqual(first, os.path.join(glob, "my-boox.conf"))
+
 
 class TestCacheAndGrouping(unittest.TestCase):
     def test_cache_round_trip_and_path_resolution(self) -> None:
@@ -2820,16 +2977,18 @@ class TestRegressions(unittest.TestCase):
     #    config sitting at the conventional path was simply not found.
     def test_config_search_order_matches_the_convention(self) -> None:
         home = os.path.expanduser("~")
-        self.assertEqual(CONFIG_SEARCH_PATHS, [
-            "/LINKS/default/my-boox.conf",
-            "/LINKS/default/my-boox",
+        searched = config_search_paths(Site(config_search_dir="/site/default"))
+        self.assertEqual(searched, [
+            "/site/default/my-boox.conf",
+            "/site/default/my-boox",
             os.path.join(home, ".my-boox.conf"),
             "/etc/my-boox.conf",
             "/usr/local/etc/my-boox.conf",
         ])
+        self.assertEqual(config_search_paths(Site()), searched[2:])
         # The dot belongs to the home entry alone.
-        self.assertNotIn(os.path.join(home, "my-boox.conf"), CONFIG_SEARCH_PATHS)
-        self.assertFalse(any(p.endswith(".ini") for p in CONFIG_SEARCH_PATHS))
+        self.assertNotIn(os.path.join(home, "my-boox.conf"), searched)
+        self.assertFalse(any(p.endswith(".ini") for p in searched))
 
     def test_env_var_wins_over_the_config_search_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2850,8 +3009,8 @@ class TestRegressions(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 206)
             self.assertIn(CONFIG_ENV_VAR, err.getvalue())
             with mock.patch.dict(os.environ, {CONFIG_ENV_VAR: ""}, clear=False), \
-                 mock.patch.object(sys.modules[__name__], "CONFIG_SEARCH_PATHS",
-                                   [os.path.join(tmpdir, "my-boox.conf")]):
+                 mock.patch.object(sys.modules[__name__], "config_search_paths",
+                                   return_value=[os.path.join(tmpdir, "my-boox.conf")]):
                 # Nothing there -> the documented 206.
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as ctx:
@@ -3811,7 +3970,12 @@ def run_self_tests(selected_group: Optional[str] = None) -> int:
     sys.stdout.flush()
     # verbosity 0: the per-test `ok K - name` lines replace unittest's
     # `test_x (...) ... ok` ones; failures are still printed in full below.
-    result = unittest.TextTestRunner(verbosity=0, resultclass=_TapResult).run(suite)
+    # No test reads this machine's site file: one that needs a site file
+    # writes its own.
+    with tempfile.TemporaryDirectory() as tmpdir, \
+         mock.patch.object(sys.modules[__name__], "SITE_CONF",
+                           os.path.join(tmpdir, "site.conf")):
+        result = unittest.TextTestRunner(verbosity=0, resultclass=_TapResult).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
@@ -4030,13 +4194,20 @@ api_retry_delays_repeat_seconds = 3, 10
 
   SEARCH ORDER (first match wins, no merging across locations):
       0. $MY_BOOX_CONFIG, if set and non-empty (wins outright)
-      1. /LINKS/default/my-boox.conf
+      1. <CONFIG_SEARCH_DIR>/my-boox.conf, then <CONFIG_SEARCH_DIR>/my-boox
+                                -- only when {SITE_CONF}
+                                   names a CONFIG_SEARCH_DIR
       2. ~/.my-boox.conf        (dot-prefixed, home only)
       3. /etc/my-boox.conf
       4. /usr/local/etc/my-boox.conf
 
-  Running a command with no config anywhere in that order exits 206 with
-  the list of paths searched.
+  {SITE_CONF}, when there, is read before the config:
+  plain KEY="value" lines -- CONFIG_SEARCH_DIR, and CONFIG_OFFER_DIR with
+  CONFIG_OFFER_NOTE, the place offered first when no config is found.
+  Without it, both are skipped; there but unreadable exits 207.
+
+  Running a command with no config anywhere in that order exits 206,
+  offering the places to write one, most common first.
 
   Run 'my-boox --config' with no other arguments at any time to see exactly
   which of these paths it currently resolves to.
@@ -4087,6 +4258,8 @@ EXIT CODES
        request-code/obtain-token API call itself failed)
   206  no config file found (search order exhausted, or the --config PATH
        given does not exist)
+  207  {SITE_CONF} is there but unreadable, or holds a line
+       that is not a plain KEY="value"
   130  interrupted with Ctrl-C
 """)
 
